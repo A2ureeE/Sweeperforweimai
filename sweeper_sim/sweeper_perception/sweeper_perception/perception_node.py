@@ -15,6 +15,7 @@ Publishes:
   /perception/obstacle_points    geometry_msgs/PolygonStamped  (world frame, static)
   /perception/dynamic_obstacles  geometry_msgs/PoseArray       (world frame, moving)
   /perception/gate_event         std_msgs/String               ('approaching'|'clear')
+  /perception/gate_pose          geometry_msgs/PoseStamped     (gate center + approach yaw)
 """
 import math
 import time
@@ -25,7 +26,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PolygonStamped, PoseArray, Pose, Point32
+from geometry_msgs.msg import PolygonStamped, PoseArray, Pose, Point32, PoseStamped
 from std_msgs.msg import String
 import tf_transformations as tft
 
@@ -96,12 +97,14 @@ class PerceptionNode(Node):
         self.sub_odom = self.create_subscription(
             Odometry, '/odom', self.cb_odom, sensor_qos)
 
-        self.pub_obs  = self.create_publisher(
+        self.pub_obs       = self.create_publisher(
             PolygonStamped, '/perception/obstacle_points', 5)
-        self.pub_dyn  = self.create_publisher(
+        self.pub_dyn       = self.create_publisher(
             PoseArray, '/perception/dynamic_obstacles', 5)
-        self.pub_gate = self.create_publisher(
+        self.pub_gate      = self.create_publisher(
             String, '/perception/gate_event', 5)
+        self.pub_gate_pose = self.create_publisher(
+            PoseStamped, '/perception/gate_pose', 5)
 
         self.robot_pose = None   # (x, y, yaw)
         self.tracks: dict[int, Track] = {}
@@ -188,7 +191,9 @@ class PerceptionNode(Node):
             del self.tracks[k]
 
         # ── 门检测（改进版：要求两锥桶的连线垂直于前进方向）──
-        gate_event = 'clear'
+        gate_event  = 'clear'
+        best_gate   = None    # (center_x, center_y, approach_yaw, gap)
+        best_dist   = float('inf')
         for i in range(len(front_cones)):
             cx1, cy1, b1 = front_cones[i]
             for j in range(i + 1, len(front_cones)):
@@ -205,9 +210,16 @@ class PerceptionNode(Node):
                 # 允许 ±35° 的误差
                 if perp_diff < math.radians(35):
                     gate_event = 'approaching'
-                    break
-            if gate_event == 'approaching':
-                break
+                    # 记录最近的门（多扇门时取最近）
+                    gcx = (cx1 + cx2) / 2.0
+                    gcy = (cy1 + cy2) / 2.0
+                    d_to_gate = math.hypot(gcx - rx, gcy - ry)
+                    if d_to_gate < best_dist:
+                        best_dist = d_to_gate
+                        # 进门方向 = 机器人当前朝向（在前方检测到才保存）
+                        best_gate = (gcx, gcy, ryaw, gap)
+        if gate_event != 'approaching':
+            best_gate = None
 
         # ── 发布 ──
         obs_msg = PolygonStamped()
@@ -234,6 +246,19 @@ class PerceptionNode(Node):
         self.pub_dyn.publish(dyn_msg)
 
         self.pub_gate.publish(String(data=gate_event))
+
+        # ── 发布门中心位姿（供规划层生成穿门路径）──
+        if best_gate is not None:
+            gcx, gcy, g_yaw, _ = best_gate
+            gp = PoseStamped()
+            gp.header.stamp    = msg.header.stamp
+            gp.header.frame_id = 'odom'
+            gp.pose.position.x = float(gcx)
+            gp.pose.position.y = float(gcy)
+            q = tft.quaternion_from_euler(0, 0, g_yaw)
+            gp.pose.orientation.x = q[0]; gp.pose.orientation.y = q[1]
+            gp.pose.orientation.z = q[2]; gp.pose.orientation.w = q[3]
+            self.pub_gate_pose.publish(gp)
 
     # ── 内部工具 ─────────────────────────────────────────────────────────
     def _cluster(self, pts: list) -> list:

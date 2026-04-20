@@ -244,7 +244,7 @@ class ControllerNode(Node):
         pts = self.ref
         n   = len(pts)
         lo  = max(0, self.ref_idx_hint - 5)
-        hi  = min(n - 1, self.ref_idx_hint + 50)
+        hi  = min(n - 1, self.ref_idx_hint + 100)
         sub = pts[lo: hi + 1]
 
         best_d = float('inf')
@@ -276,7 +276,7 @@ class ControllerNode(Node):
             cte         *= 0.3
 
         v_eps  = max(0.5, rv)
-        delta  = (self.stanley_hg * heading_err +
+        delta  = (self.stanley_hg * heading_err -
                   math.atan2(self.stanley_k * cte, v_eps))
         delta  = max(-self.delta_max, min(self.delta_max, delta))
 
@@ -304,25 +304,72 @@ class ControllerNode(Node):
         arc = math.hypot(dx, dy)
         return da / arc
 
-    # ── 壁面贴边 PD（直接使用激光数据）────────────────────────────────
+    # ── 壁面贴边 PD + 朝向修正（直接使用激光数据）──────────────────────
     def _edge_follow_pd(self):
         """
-        PD 控制：维持与侧面墙壁的距离 = wall_dist_ref。
-        wall_side 由 behavior_node 通过 EDGE_FOLLOW_left/right 指定。
-        直接从 /scan 读取侧向最近距离，消除 obstacle_points 不含墙面的缺陷。
-        """
-        wall_d = self._get_side_dist(self.wall_side)
-        err    = self.wall_ref - wall_d
-        derr   = (err - self._wall_err_prev) / max(1e-3, self.dt)
-        self._wall_err_prev = err
+        改进版贴边控制：同时修正侧向距离误差和机器人朝向（与墙面平行）。
 
-        # 正 err → 太近墙 → 向外转（正 omega = 向左转）
-        # wall_side == 'right': 墙在右，err>0 应向左转 → omega 正
-        # wall_side == 'left':  墙在左，err>0 应向右转 → omega 负
+        朝向估算：
+          在侧向扇区前半段（±15°偏移）和后半段各取最近距离，
+          两者之差 / 两段的前后间距 ≈ sin(偏斜角)，可估算机器人偏离墙方向的角度。
+
+        控制律：
+          omega = sign * (kp_wall * dist_err + kd_wall * d_dist_err
+                         + k_heading * heading_err)
+        """
+        # 侧向距离（90° 处）
+        wall_d   = self._get_side_dist(self.wall_side)
+        dist_err = self.wall_ref - wall_d
+        derr     = (dist_err - self._wall_err_prev) / max(1e-3, self.dt)
+        self._wall_err_prev = dist_err
+
+        # 朝向误差估计（比较前侧和后侧的壁面距离差）
+        heading_err = self._estimate_wall_heading_err(self.wall_side)
+
+        # 符号规则：
+        #   wall_side='right': 墙在右; dist_err>0 表示太近→向左; heading_err>0 表示头朝墙→向右
+        #   wall_side='left':  墙在左; dist_err>0 表示太近→向右; heading_err>0 表示头朝墙→向左
         sign  = 1.0 if self.wall_side == 'right' else -1.0
-        omega = sign * (self.kp_wall * err + self.kd_wall * derr)
-        v     = max(self.v_min, self.speed_limit * 0.65)
+        omega = sign * (self.kp_wall * dist_err + self.kd_wall * derr
+                        - 0.5 * heading_err)   # heading修正方向与距离修正相反
+
+        v = max(self.v_min, self.speed_limit * 0.65)
         return v, omega
+
+    def _estimate_wall_heading_err(self, side: str) -> float:
+        """
+        估算机器人朝向与墙面的偏差角（弧度）。
+        正值 = 机器人前端比后端更靠近墙（头朝墙）。
+        方法：取侧向扇区内前 1/3 和后 1/3 的最近距离之差。
+        """
+        if not self.scan_ranges:
+            return 0.0
+        front_d = 5.0
+        rear_d  = 5.0
+        # 前段：60°~80°；后段：100°~120°（相对于机器人正前方）
+        front_min = math.radians(60)
+        front_max = math.radians(80)
+        rear_min  = math.radians(100)
+        rear_max  = math.radians(120)
+        for i, r in enumerate(self.scan_ranges):
+            if not (0.05 < r < 4.0):
+                continue
+            angle = self.scan_angle_min + i * self.scan_angle_inc
+            abs_a = abs(angle)
+            # 只看目标侧
+            is_target = (side == 'right' and angle < 0) or (side == 'left' and angle > 0)
+            if not is_target:
+                continue
+            if front_min <= abs_a <= front_max:
+                front_d = min(front_d, r)
+            elif rear_min <= abs_a <= rear_max:
+                rear_d  = min(rear_d, r)
+        # 差值越大表示偏角越大；归一化到 ~弧度
+        diff = front_d - rear_d
+        # 两段采样点间的纵向距离约为 scan_separation（robot_body_length ≈ 0.8m）
+        scan_sep = 0.6   # 前后采样圆弧对应的纵向间距估计（m）
+        heading_err = math.atan2(diff, scan_sep) if abs(diff) < 1.5 else 0.0
+        return heading_err
 
     def _get_side_dist(self, side: str) -> float:
         """从激光数据获取指定侧（left/right）90°方向的最近壁面距离。"""

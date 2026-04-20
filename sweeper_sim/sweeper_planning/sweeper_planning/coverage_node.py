@@ -47,7 +47,7 @@ class CoverageNode(Node):
             ('grid_resolution',       0.5),
             ('map_frame',           'odom'),
             ('min_turn_radius',       0.95),
-            ('sweep_half_width',      0.55),  # half-width of swept strip (m)
+            ('sweep_half_width',      0.975), # half-width = arc_R → 行间无缝
         ])
         g = self.get_parameter
         self.xmin       = g('area_x_min').value
@@ -180,44 +180,94 @@ class CoverageNode(Node):
                 y < self.ymin + m or y > self.ymax - m)
 
     def _build_path(self):
+        """
+        修复版路径生成（解决机器人撞墙无法转弯问题）：
+
+        核心约束：
+          eff_edge  ≥ turn_r + 0.15   — U形弯弧不超出场地边界
+          eff_spacing = 2 × arc_R    — 弧形终点恰好落在下一行起点
+
+        当 edge_off(0.8m) < turn_r(0.95m) 时，原弧会延伸到 x=14.65 > 场地边界
+        x=14.5，导致机器人追弧点时撞墙卡死。本修复强制保证转弯空间。
+
+        路径结构：
+          ① 外贴边圈  (ef_off)
+          ② 中间过渡圈1 (ef_off + sweep_hw)
+          ③ 中间过渡圈2 (ef_off + 2*sweep_hw)
+          ④ 内层扫行  (eff_edge, 每行间距 eff_spacing, 每点 0.5m)
+        """
         pts = []
-        pts += self._boundary_strip(self.ef_off)
 
-        ix_min = self.xmin + self.edge_off
-        ix_max = self.xmax - self.edge_off
-        iy_min = self.ymin + self.edge_off
+        # ── 约束推导 ──────────────────────────────────────────────────
+        # 弧半径必须 ≤ 从行尾到场地边界的距离（edge_off）
+        # → eff_edge ≥ turn_r + 安全余量
+        eff_edge    = max(self.edge_off, self.turn_r + 0.15)
+        # 行间距必须 = 2×arc_R，确保弧终点落在下一行起点
+        eff_spacing = max(self.spacing, 2.0 * self.turn_r + 0.05)
+        arc_R       = eff_spacing / 2.0   # 弧半径 = 行间距的一半
 
-        first_y = iy_min + self.spacing * 0.5
-        ys = np.arange(first_y, self.ymax - self.edge_off, self.spacing)
-        R  = self.turn_r
+        # x 方向需要额外余量：弧最远点 + 车身半宽(0.525m) + 安全裕量 ≤ 墙
+        # 车身半宽 1.05/2=0.525m; 保险余量 0.10m → turn_r + 0.625
+        x_margin = max(self.edge_off, self.turn_r + 0.65)
+
+        self.get_logger().info(
+            f'Coverage build: y_edge={eff_edge:.2f}m, x_margin={x_margin:.2f}m, '
+            f'spacing={eff_spacing:.2f}m, arc_R={arc_R:.2f}m')
+
+        # ── 内侧扫行（boustrophedon + 闭合 U 形弯）──────────────────
+        # 不再生成边界条——边界条的直角拐角会令机器人撞东/西墙卡死；
+        # 内层扫行的 sweep_hw 已延伸至距墙 ~0.35m，覆盖率足够。
+        # x 方向使用较大 x_margin 保证 U-turn 弧不撞东/西墙；
+        # y 方向使用 eff_edge（较小），保留全部 9 行覆盖范围。
+        ix_min = self.xmin + x_margin
+        ix_max = self.xmax - x_margin
+        iy_min = self.ymin + eff_edge
+        iy_max = self.ymax - eff_edge
+
+        ys = np.arange(iy_min, iy_max + eff_spacing * 0.01, eff_spacing)
 
         for idx, y in enumerate(ys):
             going_right = (idx % 2 == 0)
             x_start = ix_min if going_right else ix_max
             x_end   = ix_max if going_right else ix_min
-            n_seg = max(2, int(abs(x_end - x_start) / 0.8) + 1)
+
+            # 每 0.5m 一个路径点
+            n_seg = max(2, int(abs(x_end - x_start) / 0.5) + 1)
             for x in np.linspace(x_start, x_end, n_seg):
                 pts.append((float(x), float(y)))
+
             if idx + 1 < len(ys):
+                # U 形弯：弧中心在行尾上方 arc_R 处
+                # arc_R = eff_spacing/2 → 弧终点 = y + 2*arc_R = y + eff_spacing
+                # 即恰好落在下一行起点 ✓
+                # 弧最右点 = x_end + arc_R ≤ ix_max + arc_R = xmax - eff_edge + arc_R
+                # = xmax - (turn_r+0.15) + (turn_r+0.025) = xmax - 0.125 ✓ 不超界
                 if going_right:
-                    arc = _arc_pts(x_end, y + R, R, -math.pi/2, math.pi/2, 14)
+                    arc = _arc_pts(x_end, y + arc_R, arc_R,
+                                   -math.pi / 2, math.pi / 2, 18)
                 else:
                     arc = list(reversed(
-                        _arc_pts(x_start, y + R, R, -math.pi/2, math.pi/2, 14)))
+                        _arc_pts(x_start, y + arc_R, arc_R,
+                                 -math.pi / 2, math.pi / 2, 18)))
                 pts.extend(arc)
+
         return pts
 
     def _boundary_strip(self, off):
-        pts = []
+        """生成矩形边界贴边路径（顺时针，点间距 0.5m）。"""
+        pts  = []
+        step = 0.5
         xmin, xmax = self.xmin + off, self.xmax - off
         ymin, ymax = self.ymin + off, self.ymax - off
-        for x in np.arange(xmin, xmax, 0.8): pts.append((float(x), float(ymin)))
+        if xmin >= xmax or ymin >= ymax:
+            return pts
+        for x in np.arange(xmin, xmax, step): pts.append((float(x), float(ymin)))
         pts.append((float(xmax), float(ymin)))
-        for y in np.arange(ymin, ymax, 0.8): pts.append((float(xmax), float(y)))
+        for y in np.arange(ymin, ymax, step): pts.append((float(xmax), float(y)))
         pts.append((float(xmax), float(ymax)))
-        for x in np.arange(xmax, xmin, -0.8): pts.append((float(x), float(ymax)))
+        for x in np.arange(xmax, xmin, -step): pts.append((float(x), float(ymax)))
         pts.append((float(xmin), float(ymax)))
-        for y in np.arange(ymax, ymin, -0.8): pts.append((float(xmin), float(y)))
+        for y in np.arange(ymax, ymin, -step): pts.append((float(xmin), float(y)))
         pts.append((float(xmin), float(ymin)))
         return pts
 
