@@ -1,0 +1,9 @@
+rtk_to_odom_node:
+  ros__parameters:
+    ref_lat: 0.0
+    ref_lon: 0.0
+    use_rtk_heading: true
+    quality_thresh: 4
+    broadcast_tf: true
+    odom_frame: "odom"
+    base_frame: "base_footprint"

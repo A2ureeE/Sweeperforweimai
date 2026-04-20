@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mc</name>
+  <version>0.0.0</version>
+  <description>电机控制包</description>
+  <maintainer email="cxh@todo.todo">cxh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>sweeper_interfaces</depend>
+  <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>logger</depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

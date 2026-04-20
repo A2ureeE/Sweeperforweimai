@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Stanley 混合路径跟踪控制器 — Z200 清扫车
+
+已修复的关键缺陷：
+  1. edge_follow PD 使用 obstacle_points（不含墙面），实际上无墙面距离数据。
+     改为直接订阅 /scan，从侧向激光测距中获取壁面距离。
+  2. stuck 检测盲区 — 机器人若以小圆绕行，每帧移动距离均 > stuck_d 但永远
+     不前进。改为统计 3s 窗口内的净位移（终点-起点距离），而非累积路程。
+  3. EDGE_FOLLOW_left / EDGE_FOLLOW_right 模式字符串支持。
+  4. omega clamping 与 v_min 的不一致性（旧版先用 v_sched 计算 kin_max，
+     再提升 v 到 v_min，导致 omega 超过 kin 约束）— 现在 v_min 提升后重算。
+
+Subscribes:
+  /reference_path              nav_msgs/Path
+  /odom                        nav_msgs/Odometry
+  /behavior/mode               std_msgs/String
+  /behavior/speed_limit        std_msgs/Float32
+  /scan                        sensor_msgs/LaserScan  (新增，用于壁面跟踪)
+
+Publishes:
+  /cmd_vel                     geometry_msgs/Twist
+"""
+import math
+import time
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from nav_msgs.msg import Path, Odometry
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String, Float32
+import tf_transformations as tft
+
+
+def yaw_from_quat(q):
+    return tft.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+
+
+def wrap(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class ControllerNode(Node):
+    def __init__(self):
+        super().__init__('controller_node')
+        self.declare_parameters('', [
+            ('control_rate_hz',         10.0),
+            ('wheel_base',               1.05),
+            ('max_steer_angle',          0.8727),   # ~50°
+            ('max_angular_rate',         0.9),
+            ('target_speed',             0.8),
+            ('min_tracking_speed',       0.25),
+            # Stanley 增益
+            ('stanley_k',               0.8),
+            ('stanley_heading_gain',     1.0),
+            # 速度调度
+            ('curvature_speed_gain',     0.6),
+            # Stuck 检测（净位移）
+            ('stuck_window_s',           3.0),    # 统计窗口
+            ('stuck_net_thresh',         0.12),   # 窗口内净位移低于此 = stuck
+            ('recovery_forward_speed',   0.35),
+            ('recovery_hold_s',          2.5),
+            # 壁面跟踪 PD（现在使用 /scan 数据）
+            ('wall_dist_ref',            0.35),
+            ('kp_wall',                  0.6),
+            ('kd_wall',                  0.12),
+            # 侧向扫描角度范围（激光帧，度）
+            ('side_scan_angle_min_deg',  70.0),
+            ('side_scan_angle_max_deg', 110.0),
+        ])
+        g = self.get_parameter
+        self.L          = g('wheel_base').value
+        self.delta_max  = g('max_steer_angle').value
+        self.w_max      = g('max_angular_rate').value
+        self.v_target   = g('target_speed').value
+        self.v_min      = g('min_tracking_speed').value
+        self.stanley_k  = g('stanley_k').value
+        self.stanley_hg = g('stanley_heading_gain').value
+        self.curv_gain  = g('curvature_speed_gain').value
+        self.stuck_win  = g('stuck_window_s').value
+        self.stuck_thr  = g('stuck_net_thresh').value
+        self.rec_spd    = g('recovery_forward_speed').value
+        self.rec_hold   = g('recovery_hold_s').value
+        self.wall_ref   = g('wall_dist_ref').value
+        self.kp_wall    = g('kp_wall').value
+        self.kd_wall    = g('kd_wall').value
+        self.side_a_min = math.radians(g('side_scan_angle_min_deg').value)
+        self.side_a_max = math.radians(g('side_scan_angle_max_deg').value)
+        self.dt         = 1.0 / g('control_rate_hz').value
+
+        sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.sub_ref   = self.create_subscription(Path,      '/reference_path',       self.cb_ref,   5)
+        self.sub_odom  = self.create_subscription(Odometry,  '/odom',                 self.cb_odom,  sensor_qos)
+        self.sub_mode  = self.create_subscription(String,    '/behavior/mode',        self.cb_mode,  5)
+        self.sub_speed = self.create_subscription(Float32,   '/behavior/speed_limit', self.cb_speed, 5)
+        self.sub_scan  = self.create_subscription(LaserScan, '/scan',                 self.cb_scan,  sensor_qos)
+
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 5)
+
+        # 状态
+        self.ref: list          = []
+        self.ref_idx_hint       = 0
+        self.robot              = None    # (x, y, yaw, v)
+        self.mode               = 'COVERAGE'
+        self.wall_side          = 'right' # 'left' 或 'right'
+        self.speed_limit        = self.v_target
+        self.scan_ranges        = []
+        self.scan_angle_min     = 0.0
+        self.scan_angle_inc     = 0.0
+
+        # Stuck 检测：滑动窗口存储最近 stuck_win 秒的位置
+        self._pos_history: list = []   # [(t, x, y), ...]
+
+        # 恢复状态
+        self._recovering  = False
+        self._rec_end_t   = 0.0
+
+        # 壁面 PD 状态
+        self._wall_err_prev = 0.0
+
+        self.create_timer(self.dt, self.tick)
+        self.get_logger().info('controller_node ready')
+
+    # ── 回调 ────────────────────────────────────────────────────────────
+    def cb_ref(self, msg: Path):
+        self.ref = [(p.pose.position.x, p.pose.position.y,
+                     yaw_from_quat(p.pose.orientation))
+                    for p in msg.poses]
+        self.ref_idx_hint = max(0, min(self.ref_idx_hint, len(self.ref) - 1))
+
+    def cb_odom(self, msg: Odometry):
+        x   = msg.pose.pose.position.x
+        y   = msg.pose.pose.position.y
+        yaw = yaw_from_quat(msg.pose.pose.orientation)
+        v   = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+        self.robot = (x, y, yaw, v)
+
+    def cb_mode(self, msg: String):
+        raw = msg.data
+        if raw == 'EDGE_FOLLOW_left':
+            self.mode      = 'EDGE_FOLLOW'
+            self.wall_side = 'left'
+        elif raw == 'EDGE_FOLLOW_right':
+            self.mode      = 'EDGE_FOLLOW'
+            self.wall_side = 'right'
+        elif raw == 'EDGE_FOLLOW':
+            self.mode = 'EDGE_FOLLOW'
+        else:
+            self.mode = raw
+
+    def cb_speed(self, msg: Float32):
+        self.speed_limit = float(msg.data)
+
+    def cb_scan(self, msg: LaserScan):
+        self.scan_ranges    = list(msg.ranges)
+        self.scan_angle_min = msg.angle_min
+        self.scan_angle_inc = msg.angle_increment
+
+    # ── 主控制循环 ───────────────────────────────────────────────────────
+    def tick(self):
+        cmd = Twist()
+        if self.robot is None:
+            self.pub_cmd.publish(cmd)
+            return
+
+        rx, ry, ryaw, rv = self.robot
+        now = time.time()
+
+        # ── Stuck 检测（净位移版）──────────────────────────────────────
+        self._pos_history.append((now, rx, ry))
+        # 清除超出窗口的历史
+        cutoff = now - self.stuck_win
+        self._pos_history = [(t, x, y) for t, x, y in self._pos_history
+                             if t >= cutoff]
+
+        stuck = False
+        if len(self._pos_history) >= 3:
+            t0, x0, y0 = self._pos_history[0]
+            net_disp = math.hypot(rx - x0, ry - y0)
+            if (now - t0 >= self.stuck_win * 0.8 and
+                    net_disp < self.stuck_thr and
+                    self.mode in ('COVERAGE', 'STATIC_DETOUR')):
+                stuck = True
+
+        # ── 恢复逻辑 ────────────────────────────────────────────────────
+        if self._recovering:
+            if now < self._rec_end_t:
+                cmd.linear.x  = float(self.rec_spd)
+                cmd.angular.z = 0.0
+                self.pub_cmd.publish(cmd)
+                return
+            else:
+                self._recovering = False
+                self.ref_idx_hint = min(len(self.ref) - 1,
+                                        self.ref_idx_hint + 8)
+                self._pos_history.clear()
+
+        if stuck and not self._recovering:
+            self.get_logger().warn('Stuck 检测触发 — 直行恢复')
+            self._recovering = True
+            self._rec_end_t  = now + self.rec_hold
+            cmd.linear.x  = float(self.rec_spd)
+            cmd.angular.z = 0.0
+            self.pub_cmd.publish(cmd)
+            return
+
+        # ── STOP 模式 ──────────────────────────────────────────────────
+        if self.mode == 'STOP' or self.speed_limit <= 0.0:
+            self.pub_cmd.publish(cmd)
+            return
+
+        # ── 无路径 ─────────────────────────────────────────────────────
+        if not self.ref or len(self.ref) < 2:
+            self.pub_cmd.publish(cmd)
+            return
+
+        # ── 控制策略选择 ────────────────────────────────────────────────
+        if self.mode == 'EDGE_FOLLOW':
+            v, omega = self._edge_follow_pd()
+        else:
+            v, omega = self._stanley_track(rx, ry, ryaw, rv)
+
+        # 应用速度限制
+        v = min(v, self.speed_limit)
+
+        # 先确定最终速度，再计算运动学约束
+        if abs(omega) > 0.05:
+            v = max(v, self.v_min)
+
+        # 运动学约束：|omega| ≤ v·tan(δ_max)/L
+        omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
+        omega = max(-min(self.w_max, omega_kin_max),
+                    min(min(self.w_max, omega_kin_max), omega))
+
+        cmd.linear.x  = float(v)
+        cmd.angular.z = float(omega)
+        self.pub_cmd.publish(cmd)
+
+    # ── Stanley 路径跟踪 ─────────────────────────────────────────────────
+    def _stanley_track(self, rx, ry, ryaw, rv):
+        pts = self.ref
+        n   = len(pts)
+        lo  = max(0, self.ref_idx_hint - 5)
+        hi  = min(n - 1, self.ref_idx_hint + 50)
+        sub = pts[lo: hi + 1]
+
+        best_d = float('inf')
+        best_i = lo
+        for i, (px, py, _) in enumerate(sub):
+            d = math.hypot(rx - px, ry - py)
+            if d < best_d:
+                best_d = d
+                best_i = lo + i
+
+        if best_i > self.ref_idx_hint:
+            self.ref_idx_hint = best_i
+
+        idx = self.ref_idx_hint
+        nxt = min(idx + 1, n - 1)
+        path_yaw = math.atan2(pts[nxt][1] - pts[idx][1],
+                               pts[nxt][0] - pts[idx][0])
+        heading_err = wrap(path_yaw - ryaw)
+
+        px, py, _ = pts[idx]
+        dx = rx - px;  dy = ry - py
+        cte = -math.sin(path_yaw) * dx + math.cos(path_yaw) * dy
+
+        # 抑制后向分量
+        angle_to_next = math.atan2(pts[nxt][1] - ry, pts[nxt][0] - rx)
+        behind = abs(wrap(angle_to_next - ryaw)) > 1.8
+        if behind:
+            heading_err *= 0.3
+            cte         *= 0.3
+
+        v_eps  = max(0.5, rv)
+        delta  = (self.stanley_hg * heading_err +
+                  math.atan2(self.stanley_k * cte, v_eps))
+        delta  = max(-self.delta_max, min(self.delta_max, delta))
+
+        kappa   = self._estimate_curvature(idx)
+        v_sched = self.v_target / (1.0 + self.curv_gain * abs(kappa))
+        v_sched = max(self.v_min, v_sched)
+
+        omega = v_sched * math.tan(delta) / self.L
+        return v_sched, omega
+
+    def _estimate_curvature(self, idx: int) -> float:
+        pts = self.ref
+        n   = len(pts)
+        i0  = max(0, idx - 3)
+        i2  = min(n - 1, idx + 3)
+        if i2 <= i0:
+            return 0.0
+        dx = pts[i2][0] - pts[i0][0]
+        dy = pts[i2][1] - pts[i0][1]
+        if math.hypot(dx, dy) < 1e-3:
+            return 0.0
+        da  = wrap(math.atan2(dy, dx) - math.atan2(
+            pts[min(n-1, idx+1)][1] - pts[max(0, idx-1)][1],
+            pts[min(n-1, idx+1)][0] - pts[max(0, idx-1)][0]))
+        arc = math.hypot(dx, dy)
+        return da / arc
+
+    # ── 壁面贴边 PD（直接使用激光数据）────────────────────────────────
+    def _edge_follow_pd(self):
+        """
+        PD 控制：维持与侧面墙壁的距离 = wall_dist_ref。
+        wall_side 由 behavior_node 通过 EDGE_FOLLOW_left/right 指定。
+        直接从 /scan 读取侧向最近距离，消除 obstacle_points 不含墙面的缺陷。
+        """
+        wall_d = self._get_side_dist(self.wall_side)
+        err    = self.wall_ref - wall_d
+        derr   = (err - self._wall_err_prev) / max(1e-3, self.dt)
+        self._wall_err_prev = err
+
+        # 正 err → 太近墙 → 向外转（正 omega = 向左转）
+        # wall_side == 'right': 墙在右，err>0 应向左转 → omega 正
+        # wall_side == 'left':  墙在左，err>0 应向右转 → omega 负
+        sign  = 1.0 if self.wall_side == 'right' else -1.0
+        omega = sign * (self.kp_wall * err + self.kd_wall * derr)
+        v     = max(self.v_min, self.speed_limit * 0.65)
+        return v, omega
+
+    def _get_side_dist(self, side: str) -> float:
+        """从激光数据获取指定侧（left/right）90°方向的最近壁面距离。"""
+        if not self.scan_ranges:
+            return self.wall_ref + 1.0
+        best = 5.0
+        for i, r in enumerate(self.scan_ranges):
+            if not (0.05 < r < 4.0):
+                continue
+            angle = self.scan_angle_min + i * self.scan_angle_inc
+            abs_a = abs(angle)
+            if not (self.side_a_min <= abs_a <= self.side_a_max):
+                continue
+            if side == 'right' and angle < 0:
+                best = min(best, r)
+            elif side == 'left' and angle > 0:
+                best = min(best, r)
+        return best
+
+
+def main():
+    rclpy.init()
+    node = ControllerNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

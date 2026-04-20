@@ -1,0 +1,9 @@
+mc_bridge_node:
+  ros__parameters:
+    wheel_base: 1.05          # meters, matches URDF / control config
+    max_rpm: 6000.0          # motor RPM range
+    max_speed: 1.3            # m/s, matches control.yaml
+    max_steer_angle: 0.8727  # radians = 50 degrees, matches URDF
+    steer_scale: 7.0         # angle-to-raw conversion scale
+    steer_offset: 1024.0      # angle-to-raw conversion offset
+    rate_hz: 20.0

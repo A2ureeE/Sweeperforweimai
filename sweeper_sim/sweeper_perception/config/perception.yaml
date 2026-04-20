@@ -1,0 +1,12 @@
+perception_node:
+  ros__parameters:
+    cluster_dist:        0.25
+    cluster_min_pts:     2
+    cluster_max_pts:     60
+    max_range:           8.0
+    wall_min_extent:     0.8
+    dynamic_speed_thresh: 0.15
+    track_timeout:       1.0
+    gate_dist_thresh:    4.0
+    gate_width_min:      0.8
+    gate_width_max:      2.5

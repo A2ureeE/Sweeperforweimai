@@ -1,0 +1,2 @@
+bool ready
+string vid

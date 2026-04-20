@@ -1,0 +1,50 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+
+# Gazebo / simulation outputs
+*.bag
+*.db3
+*.db3-shm
+*.db3-wal
+*.world.swp
+
+# Runtime logs and generated reports
+*.log
+*.csv
+*.jsonl
+analysis.png
+
+# Local ROS runtime files
+.ros/
+
+# Archives / temp
+*.zip
+*.tar
+*.tar.gz
+*.tmp
+*.bak

@@ -1,0 +1,22 @@
+coverage_node:
+  ros__parameters:
+    area_x_min:  -12.0
+    area_x_max:   14.5
+    area_y_min:   -9.0
+    area_y_max:    9.5
+    sweep_spacing:      1.0
+    edge_offset:        0.8
+    edge_follow_offset: 0.2
+    grid_resolution:    0.5
+    map_frame: odom
+    min_turn_radius: 0.95
+
+planner_node:
+  ros__parameters:
+    lookahead_dist:       12.0
+    obstacle_inflate:      0.6
+    obstacle_memory_s:     8.0
+    gate_align_dist:       4.0
+    detour_shift_m:        1.0
+    stagnation_time_s:     6.0
+    stagnation_min_dist:   0.15

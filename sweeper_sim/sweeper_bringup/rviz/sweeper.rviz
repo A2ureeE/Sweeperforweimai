@@ -1,0 +1,83 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Description Topic:
+        Value: /robot_description
+      Enabled: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Topic:
+        Value: /scan
+      Size (m): 0.05
+      Color: 255; 255; 255
+      Enabled: true
+    - Class: rviz_default_plugins/Path
+      Name: CoveragePath
+      Topic:
+        Value: /coverage/path
+      Color: 0; 200; 50
+      Line Width: 0.05
+      Enabled: true
+    - Class: rviz_default_plugins/Path
+      Name: ReferencePath
+      Topic:
+        Value: /reference_path
+      Color: 255; 200; 0
+      Line Width: 0.08
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Cones
+      Topic:
+        Value: /perception/cones
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Pedestrians
+      Topic:
+        Value: /perception/pedestrians
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Gates
+      Topic:
+        Value: /perception/gates
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Edges
+      Topic:
+        Value: /perception/edges
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: CoverageMarkers
+      Topic:
+        Value: /coverage/markers
+      Enabled: true
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Topic:
+        Value: /odom
+      Keep: 50
+      Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 30
+      Pitch: 1.0
+      Yaw:  0.78

@@ -1,0 +1,13 @@
+pc_to_scan_node:
+  ros__parameters:
+    scan_frame: "base_footprint"
+    cloud_frame: "base_link"
+    input_topic: "/rslidar_points"
+    output_topic: "/scan"
+    angle_min: -3.14159
+    angle_max: 3.14159
+    angle_increment: 0.005
+    range_min: 0.05
+    range_max: 30.0
+    height_tolerance: 0.5
+    laser_z: 0.6

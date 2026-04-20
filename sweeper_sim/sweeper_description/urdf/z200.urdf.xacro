@@ -1,0 +1,523 @@
+<?xml version="1.0"?>
+<robot name="z200" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ========================= -->
+  <!-- base_footprint -->
+  <!-- ========================= -->
+  <link name="base_footprint" />
+
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint" />
+    <child link="base_link" />
+    <origin xyz="0 0 0.85" rpy="0 0 0" />
+  </joint>
+
+  <!-- ========================= -->
+  <!-- base_link -->
+  <!-- ========================= -->
+  <link name="base_link">
+    <!-- 车身主体（前后左右）- 浅灰色 -->
+    <visual>
+      <geometry>
+        <box size="1.52 1.05 1.10" />
+      </geometry>
+      <material name="light_gray">
+        <color rgba="0.8 0.8 0.8 1.0" />
+      </material>
+    </visual>
+
+    <!-- 车顶 - 深灰色 -->
+    <visual>
+      <geometry>
+        <box size="1.52 1.05 0.05" />
+      </geometry>
+      <origin xyz="0 0 0.525" />
+      <material name="dark_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
+    </visual>
+
+    <collision>
+      <geometry>
+        <box size="1.52 1.05 1.10" />
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="120.0" />
+      <inertia ixx="30" iyy="50" izz="60"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+
+  <!-- ========================= -->
+  <!-- Left passive wheel (no drive) -->
+  <!-- ========================= -->
+  <link name="left_wheel_link">
+    <visual>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="20.0" />
+      <inertia ixx="0.2" iyy="0.2" izz="0.2"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link" />
+    <child link="left_wheel_link" />
+    <origin xyz="-0.65 0.524 -0.487" />
+    <axis xyz="0 1 0" />
+    <!-- 后轮为被动轮，不提供动力 -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- Right passive wheel (no drive) -->
+  <!-- ========================= -->
+  <link name="right_wheel_link">
+    <visual>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="20.0" />
+      <inertia ixx="0.2" iyy="0.2" izz="0.2"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link" />
+    <child link="right_wheel_link" />
+    <origin xyz="-0.65 -0.524 -0.487" />
+    <axis xyz="0 1 0" />
+    <!-- 后轮为被动轮，不提供动力 -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- Front wheel assembly with steering -->
+  <!-- ========================= -->
+
+  <!-- Front wheel axis -->
+  <!-- <link name="front_wheel_axis">
+    <origin xyz="0.5 0 0" rpy="0 0 0" />
+  </link>
+
+  <joint name="base_to_front_wheel_axis" type="fixed">
+    <parent link="base_link" />
+    <child link="front_wheel_axis" />
+    <origin xyz="0.5 0 0" rpy="0 0 0" />
+  </joint> -->
+  <!-- 1. Steering column (for vertical rotation - steering) -->
+  <link name="front_steering_column">
+    <visual>
+      <geometry>
+        <cylinder radius="0.05" length="0.3" />
+      </geometry>
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
+      </material>
+    </visual>
+    <inertial>
+      <mass value="10.0" />
+      <inertia ixx="0.01" iyy="0.01" izz="0.01"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+
+  <!-- Steering joint (vertical rotation - around Z axis) -->
+  <joint name="front_steering_joint" type="revolute">
+    <parent link="base_link" />
+    <child link="front_steering_column" />
+    <origin xyz="0.4 0 -0.487" />
+    <axis xyz="0 0 1" />
+    <!-- 限制转向角度为±50° (0.8727弧度) -->
+    <limit lower="-0.8727" upper="0.8727" effort="100.0" velocity="2.0" />
+  </joint>
+
+  <!-- 2. Front wheel (for rolling) -->
+  <link name="front_support_wheel_link">
+    <visual>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.22" length="0.12" />
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="20.0" />
+      <inertia ixx="0.2" iyy="0.2" izz="0.2"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+
+  <!-- Rolling joint (around Y axis) -->
+    <joint name="front_wheel_joint" type="continuous">
+      <parent link="front_steering_column" />
+      <child link="front_support_wheel_link" />
+      <origin xyz="0 0 0" />
+      <axis xyz="0 1 0" />
+    </joint>
+
+  <gazebo reference="front_support_wheel_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <!-- ========================= -->
+  <!-- Decorative corner parts (visual only) -->
+  <!-- ========================= -->
+  <link name="corner_fl">
+    <visual>
+      <origin xyz="0.735 0.544 0.577" rpy="0 0 0.5236" />
+      <geometry>
+        <box size="0.28 0.16 0.06" />
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
+    </visual>
+  </link>
+  <joint name="corner_fl_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="corner_fl" />
+  </joint>
+
+  <link name="corner_fr">
+    <visual>
+      <origin xyz="0.735 -0.544 0.577" rpy="0 0 -0.5236" />
+      <geometry>
+        <box size="0.28 0.16 0.06" />
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
+    </visual>
+  </link>
+  <joint name="corner_fr_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="corner_fr" />
+  </joint>
+
+  <link name="corner_rl">
+    <visual>
+      <origin xyz="-0.735 0.544 0.577" rpy="0 0 -0.5236" />
+      <geometry>
+        <box size="0.28 0.16 0.06" />
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
+    </visual>
+  </link>
+  <joint name="corner_rl_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="corner_rl" />
+  </joint>
+
+  <link name="corner_rr">
+    <visual>
+      <origin xyz="-0.735 -0.544 0.577" rpy="0 0 0.5236" />
+      <geometry>
+        <box size="0.28 0.16 0.06" />
+      </geometry>
+      <material name="dark_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
+    </visual>
+  </link>
+  <joint name="corner_rr_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="corner_rr" />
+  </joint>
+
+  <!-- ========================= -->
+  <!-- Gazebo friction -->
+  <!-- ========================= -->
+  <gazebo reference="left_wheel_link">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <gazebo reference="right_wheel_link">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <gazebo reference="front_support_wheel_link">
+    <mu1>0.8</mu1>
+    <mu2>0.8</mu2>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>1.048</wheel_separation>
+      <wheel_diameter>0.44</wheel_diameter>
+      <max_wheel_torque>600.0</max_wheel_torque>
+      <max_wheel_acceleration>2.0</max_wheel_acceleration>
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <publish_wheel_tf>false</publish_wheel_tf>
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
+    </plugin>
+
+    <plugin name='z200_joint_state' filename='libgazebo_ros_joint_state_publisher.so'>
+      <ros>
+        <remapping>~/out:=joint_states</remapping>
+      </ros>
+      <update_rate>30</update_rate>
+      <joint_name>right_wheel_joint</joint_name>
+      <joint_name>left_wheel_joint</joint_name>
+      <joint_name>front_steering_joint</joint_name>
+    </plugin>
+  </gazebo>
+
+  <!-- Gazebo材料配置 -->
+  <gazebo reference="base_link">
+    <material>Gazebo/Gray</material>
+  </gazebo>
+
+  <gazebo reference="left_wheel_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <gazebo reference="right_wheel_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <gazebo reference="front_support_wheel_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <gazebo reference="front_steering_column">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <gazebo reference="corner_fl">
+    <material>Gazebo/DarkGray</material>
+  </gazebo>
+
+  <gazebo reference="corner_fr">
+    <material>Gazebo/DarkGray</material>
+  </gazebo>
+
+  <gazebo reference="corner_rl">
+    <material>Gazebo/DarkGray</material>
+  </gazebo>
+
+  <gazebo reference="corner_rr">
+    <material>Gazebo/DarkGray</material>
+  </gazebo>
+
+  <!-- ========================= -->
+  <!-- Laser scanner -->
+  <!-- ========================= -->
+  <link name="laser_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.05" length="0.1" />
+      </geometry>
+      <material name="red">
+        <color rgba="1.0 0.0 0.0 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.05" length="0.1" />
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.5" />
+      <inertia ixx="0.0001" iyy="0.0001" izz="0.0001"
+        ixy="0" ixz="0" iyz="0" />
+    </inertial>
+  </link>
+  <!-- laser joint - 移到车身中心 -->
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="laser_link" />
+    <!-- 车身中心位置，保持高度不变 -->
+    <origin xyz="0 0 0.125" rpy="0 0 0" />
+  </joint>
+
+  <!-- IMU link -->
+  <link name="imu_link">
+    <visual>
+      <origin xyz="0 0 0.0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.02 0.02" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.02 0.02" />
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1" />
+      <inertia ixx="0.000190416666667" ixy="0" ixz="0" iyy="0.0001904" iyz="0" izz="0.00036" />
+    </inertial>
+  </link>
+
+  <!-- IMU joint -->
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="imu_link" />
+    <!-- 车顶中央位置 -->
+    <origin xyz="0 0 0.55" rpy="0 0 0" />
+  </joint>
+
+  <!-- 激光雷达配置 - 改进版：穿透车体，排除车身区域 -->
+  <gazebo reference="laser_link">
+    <material>Gazebo/Red</material>
+    <!-- 设置激光雷达不检测自身link的碰撞，实现穿透车体 -->
+    <collision>
+      <surface>
+        <contact>
+          <collide_bitmask>0x00</collide_bitmask>
+        </contact>
+      </surface>
+    </collision>
+    <sensor name="laser_sensor" type="ray">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>5</update_rate>
+      <pose>0 0 0 0 0 0</pose>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>180</samples>
+            <resolution>1.000000</resolution>
+            <!-- 360度全向扫描 -->
+            <min_angle>-3.14159265</min_angle>  <!-- -180° in radians -->
+            <max_angle>3.14159265</max_angle>    <!-- +180° in radians -->
+          </horizontal>
+        </scan>
+        <range>
+          <!-- 最小距离设置为0.9米，排除车身区域（车身半对角线约0.9米） -->
+          <min>1.05</min>
+          <max>30</max>
+          <resolution>0.03000</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+
+      <plugin name="laserscan" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>laser_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="imu_link">
+    <sensor name="imu_sensor" type="imu">
+      <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=imu</remapping>
+        </ros>
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+      </plugin>
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <visualize>true</visualize>
+      <imu>
+        <angular_velocity>
+          <x>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>2e-4</stddev>
+              <bias_mean>0.0000075</bias_mean>
+              <bias_stddev>0.0000008</bias_stddev>
+            </noise>
+          </x>
+          <y>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>2e-4</stddev>
+              <bias_mean>0.0000075</bias_mean>
+              <bias_stddev>0.0000008</bias_stddev>
+            </noise>
+          </y>
+          <z>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>2e-4</stddev>
+              <bias_mean>0.0000075</bias_mean>
+              <bias_stddev>0.0000008</bias_stddev>
+            </noise>
+          </z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>1.7e-2</stddev>
+              <bias_mean>0.1</bias_mean>
+              <bias_stddev>0.001</bias_stddev>
+            </noise>
+          </x>
+          <y>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>1.7e-2</stddev>
+              <bias_mean>0.1</bias_mean>
+              <bias_stddev>0.001</bias_stddev>
+            </noise>
+          </y>
+          <z>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>1.7e-2</stddev>
+              <bias_mean>0.1</bias_mean>
+              <bias_stddev>0.001</bias_stddev>
+            </noise>
+          </z>
+        </linear_acceleration>
+      </imu>
+    </sensor>
+  </gazebo>
+
+</robot>

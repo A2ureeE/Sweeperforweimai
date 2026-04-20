@@ -1,0 +1,4 @@
+rtk:
+  ros__parameters:
+    # 串口设备名称
+    serial_port: "/dev/ttyTHS1"

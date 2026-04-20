@@ -1,0 +1,11 @@
+behavior_node:
+  ros__parameters:
+    emergency_brake_dist:  0.35
+    dynamic_avoid_dist:    1.8
+    static_detour_dist:    1.2
+    narrow_gate_dist:      3.0
+    edge_follow_dist:      0.55
+    wall_scan_angle_deg:  30.0
+    normal_speed:          0.8
+    narrow_gate_speed:     0.4
+    detour_speed:          0.5
