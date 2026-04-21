@@ -4,8 +4,8 @@ controller_node:
     wheel_base:           1.05
     max_steer_angle:      0.8727
     max_angular_rate:     0.9
-    target_speed:         0.8
-    min_tracking_speed:   0.25
+    target_speed:         0.2
+    min_tracking_speed:   0.0
     stanley_k:            0.8
     stanley_heading_gain: 1.0
     curvature_speed_gain: 0.6

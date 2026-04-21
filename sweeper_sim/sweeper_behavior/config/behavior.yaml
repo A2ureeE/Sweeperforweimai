@@ -7,6 +7,6 @@ behavior_node:
     edge_follow_dist:      0.55
     enable_edge_follow:    true
     wall_scan_angle_deg:  30.0
-    normal_speed:          0.8
-    narrow_gate_speed:     0.4
-    detour_speed:          0.5
+    normal_speed:          0.2
+    narrow_gate_speed:     0.2
+    detour_speed:          0.2

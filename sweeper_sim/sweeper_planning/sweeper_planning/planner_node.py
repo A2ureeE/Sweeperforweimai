@@ -88,6 +88,7 @@ class PlannerNode(Node):
 
         self.pub_ref   = self.create_publisher(Path,    '/reference_path',        5)
         self.pub_prog  = self.create_publisher(Float32, '/planner/path_progress', 5)
+        self.pub_detour_end = self.create_publisher(String, '/planner/detour_cleared', 5)
 
         self.cov_pts: list   = []
         self.robot           = None       # (x, y, yaw)
@@ -206,18 +207,15 @@ class PlannerNode(Node):
                 self.progress_idx = self._detour_start_idx
                 self._returning_from_detour = True
             self._detour_start_idx = None
+            # 通知 behavior_node 和 controller：避障结束，可以恢复路径跟踪
+            self.pub_detour_end.publish(String(data='cleared'))
 
         self._prev_mode = self.mode
 
-        # ── 前向滑动窗口找最近点 ────────────────────────────────────
+        # ── 前向滑动窗口推进 ────────────────────────────────────────────
         if self.progress_idx == 0:
-            d2      = np.sum((pts - np.array([rx, ry])) ** 2, axis=1)
-            new_idx = int(np.argmin(d2))
-            self.progress_idx = new_idx
-            self.get_logger().info(
-                f'Path接入点: idx={new_idx}, '
-                f'pos=({pts[new_idx][0]:.1f},{pts[new_idx][1]:.1f}), '
-                f'dist={math.sqrt(d2[new_idx]):.2f}m')
+            # 从路径起点出发，不做全局最近点搜索
+            self.progress_idx = 0
         elif self._returning_from_detour:
             window_end = min(n - 1, self.progress_idx + 50)
             sub  = pts[self.progress_idx: window_end + 1]

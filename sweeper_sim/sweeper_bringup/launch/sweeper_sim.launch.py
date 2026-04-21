@@ -147,11 +147,15 @@ def generate_launch_description():
         parameters=[cfg_planning, {'use_sim_time': True}],
         output='screen')
 
-    controller_node = Node(
-        package='sweeper_control', executable='controller_node',
-        name='controller_node',
-        parameters=[cfg_control, map_params],
-        output='screen')
+    controller_node = TimerAction(
+        period=30.0,
+        actions=[
+            Node(
+                package='sweeper_control', executable='controller_node',
+                name='controller_node',
+                parameters=[cfg_control, map_params],
+                output='screen')
+        ])
 
     # ── 3. Score / mission nodes ──────────────────────────────────────
     score_logger_node = Node(

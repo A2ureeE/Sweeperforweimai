@@ -84,7 +84,13 @@ class CoverageNode(Node):
         self.n_path     = 0
 
         self._build_and_publish()
+        # 等 0.5s 再发一次，确保 RViz 等 late subscriber 完全启动
         self.create_timer(0.5, self._tick)
+        self.create_timer(0.5, self._republish_path_once)
+
+    def _republish_path_once(self):
+        self._build_and_publish()
+        self._republish_path_once = lambda: None  # 只发一次，之后什么都不做
 
     # ------------------------------------------------------------------ #
     def cb_odom(self, msg: Odometry):
@@ -248,6 +254,18 @@ class CoverageNode(Node):
                     arc = _arc_pts(x_end, y + arc_R, arc_R,
                                    -math.pi / 2, -3 * math.pi / 2, 36)
                 pts.extend(arc)
+
+        # 将路径整体前移 1m（在第一段路径的前进方向上 1m 处插入一个点），
+        # 使车头对准第一个路径点，方便从起点出发。
+        if len(pts) >= 2:
+            p0, p1 = pts[0], pts[1]
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            seg_len = math.hypot(dx, dy)
+            if seg_len > 1e-4:
+                start_x = p0[0] + dx / seg_len * 1.0
+                start_y = p0[1] + dy / seg_len * 1.0
+                pts = [(float(start_x), float(start_y))] + pts
 
         return pts
 

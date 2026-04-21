@@ -17,9 +17,9 @@ Publishes:
 import math
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Path, Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PolygonStamped, PoseArray
 from std_msgs.msg import String, Float32
@@ -98,6 +98,18 @@ class BehaviorNode(Node):
 
         self.pub_mode  = self.create_publisher(String,  '/behavior/mode',        5)
         self.pub_speed = self.create_publisher(Float32, '/behavior/speed_limit', 5)
+        self.pub_recovery = self.create_publisher(String, '/behavior/recovery_cmd', 5)
+
+        # 路径就绪标志：等待全局规划路径发布后再允许启动
+        latch_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.sub_ref = self.create_subscription(
+            Path, '/coverage/path', self.cb_ref, latch_qos)
+        self._path_ready = False
+
+        # 订阅 planner 的避障结束事件
+        self.sub_detour_end = self.create_subscription(
+            String, '/planner/detour_cleared', self.cb_detour_cleared, 5)
+        self._detour_cleared = False
 
         # Robot state (world frame)
         self._robot_pos  = (0.0, 0.0)
@@ -156,6 +168,13 @@ class BehaviorNode(Node):
         else:
             self._gate_frames = max(0, self._gate_frames - 1)
         self._gate_active = (self._gate_frames >= self.gate_hyst)
+
+    def cb_ref(self, msg):
+        self._path_ready = True
+
+    def cb_detour_cleared(self, msg):
+        if msg.data == 'cleared':
+            self._detour_cleared = True
 
     # ── 工具函数 ─────────────────────────────────────────────────────────
     def _front_clear_dist(self) -> float:
@@ -250,6 +269,10 @@ class BehaviorNode(Node):
 
     # ── 主 FSM ──────────────────────────────────────────────────────────
     def tick(self):
+        # 等待全局路径就绪
+        if not self._path_ready:
+            return
+
         mode      = 'COVERAGE'
         speed_lim = self.normal_speed
 
@@ -288,6 +311,12 @@ class BehaviorNode(Node):
             self.pub_mode.publish(String(data=f'EDGE_FOLLOW_{side}'))
             self.pub_speed.publish(Float32(data=float(speed_lim)))
             return
+
+        # 避障结束：从保存的路径索引恢复，继续 Coverage
+        if self._detour_cleared:
+            self._detour_cleared = False
+            self.pub_recovery.publish(String(data='resume_coverage'))
+            self.get_logger().info('避障结束，发送 resume_coverage 恢复指令')
 
         self._publish(mode, speed_lim)
 

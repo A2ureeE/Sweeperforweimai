@@ -123,6 +123,10 @@ class ControllerNode(Node):
 
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 5)
 
+        # 恢复指令订阅（来自 behavior_node，避障结束后回归原路径）
+        self.sub_recovery = self.create_subscription(
+            String, '/behavior/recovery_cmd', self.cb_recovery, 5)
+
         # 状态
         self.ref: list          = []
         self.ref_idx_hint       = 0
@@ -147,8 +151,11 @@ class ControllerNode(Node):
         # 状态日志（每 5s 输出一次）
         self._log_v = 0.0
         self._log_w = 0.0
+        self._trajectory_received = False  # 等待 RViz 绿色轨迹
+        self._path_entry_fixed    = False  # 首次接收路径时强制从索引0出发
         self._log_front_d = 999.0
         self._log_avoid = 'none'
+        self._saved_ref_idx = 0     # 避障时保存的路径索引，恢复时使用
 
         self.create_timer(self.dt, self.tick)
         self.create_timer(5.0, self._log_status)
@@ -159,7 +166,28 @@ class ControllerNode(Node):
         self.ref = [(p.pose.position.x, p.pose.position.y,
                      yaw_from_quat(p.pose.orientation))
                     for p in msg.poses]
-        self.ref_idx_hint = 0
+        self._trajectory_received = True  # RViz 绿色轨迹已到达，可以发车
+
+        if self.robot is not None and self.ref:
+            # 仅在避障恢复时使用最近点搜索；首次启动时强制从轨迹起点(索引0)出发，
+            # 避免最近的点跳到轨迹中间导致里程浪费。
+            rx, ry, _, _ = self.robot
+            if self._path_entry_fixed:
+                # 已在轨迹上，进行避障恢复式最近点搜索
+                best_d = float('inf')
+                best_i = 0
+                for i, (px, py, _) in enumerate(self.ref):
+                    d = math.hypot(rx - px, ry - py)
+                    if d < best_d:
+                        best_d = d
+                        best_i = i
+                self.ref_idx_hint = best_i
+            else:
+                # 首次接收路径：强制从轨迹起点出发，不做最近点搜索
+                self.ref_idx_hint = 0
+                self._path_entry_fixed = True
+        else:
+            self.ref_idx_hint = 0
 
     def cb_odom(self, msg: Odometry):
         x   = msg.pose.pose.position.x
@@ -167,6 +195,11 @@ class ControllerNode(Node):
         yaw = yaw_from_quat(msg.pose.pose.orientation)
         v   = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
         self.robot = (x, y, yaw, v)
+
+        # 路径早到、odom 晚到：确保路径入口固定到起点
+        if self.ref and not self._path_entry_fixed:
+            self.ref_idx_hint = 0
+            self._path_entry_fixed = True
 
     def cb_mode(self, msg: String):
         raw = msg.data
@@ -189,6 +222,14 @@ class ControllerNode(Node):
         self.scan_angle_min = msg.angle_min
         self.scan_angle_inc = msg.angle_increment
 
+    def cb_recovery(self, msg):
+        if msg.data == 'resume_coverage':
+            self.ref_idx_hint = self._saved_ref_idx
+            self._recovering = False
+            self._pos_history.clear()
+            self.get_logger().info(
+                f'恢复 Coverage: ref_idx_hint={self._saved_ref_idx}')
+
     # ── 主控制循环 ───────────────────────────────────────────────────────
     def tick(self):
         cmd = Twist()
@@ -197,12 +238,13 @@ class ControllerNode(Node):
             return
 
         rx, ry, ryaw, rv = self.robot
-        now = time.time()
+        now_ns = self.get_clock().now().nanoseconds()
 
         # ── Stuck 检测（净位移版）──────────────────────────────────────
-        self._pos_history.append((now, rx, ry))
+        now_s = now_ns / 1e9
+        self._pos_history.append((now_s, rx, ry))
         # 清除超出窗口的历史
-        cutoff = now - self.stuck_win
+        cutoff = now_s - self.stuck_win
         self._pos_history = [(t, x, y) for t, x, y in self._pos_history
                              if t >= cutoff]
 
@@ -210,14 +252,14 @@ class ControllerNode(Node):
         if len(self._pos_history) >= 3:
             t0, x0, y0 = self._pos_history[0]
             net_disp = math.hypot(rx - x0, ry - y0)
-            if (now - t0 >= self.stuck_win * 0.8 and
+            if (now_s - t0 >= self.stuck_win * 0.8 and
                     net_disp < self.stuck_thr and
                     self.mode in ('COVERAGE', 'STATIC_DETOUR')):
                 stuck = True
 
         # ── 恢复逻辑（前方有障碍时后退转向，无障碍时前进）──────────────
         if self._recovering:
-            if now < self._rec_end_t:
+            if now_s < self._rec_end_t:
                 fd, sd = self._front_obstacle_info()
                 if fd < self.obs_steer_d:
                     cmd.linear.x  = float(-self.rec_spd * 0.5)
@@ -229,13 +271,14 @@ class ControllerNode(Node):
                 return
             else:
                 self._recovering = False
-                self.ref_idx_hint = 0
+                self.ref_idx_hint = self._saved_ref_idx  # 回到障前保存的位置
                 self._pos_history.clear()
 
         if stuck and not self._recovering:
+            self._saved_ref_idx = self.ref_idx_hint  # 进入恢复前保存当前位置
             self.get_logger().warn('Stuck 检测触发 — 恢复模式')
             self._recovering = True
-            self._rec_end_t  = now + self.rec_hold
+            self._rec_end_t  = now_s + self.rec_hold
             fd, sd = self._front_obstacle_info()
             if fd < self.obs_steer_d:
                 cmd.linear.x  = float(-self.rec_spd * 0.5)
@@ -263,8 +306,17 @@ class ControllerNode(Node):
             self.pub_cmd.publish(cmd)
             return
 
+        # ── 等待 RViz 绿色轨迹 ─────────────────────────────────────────
+        if not self._trajectory_received:
+            self.get_logger().info('等待 RViz 绿色轨迹...', throttle_duration_sec=2.0)
+            self.pub_cmd.publish(cmd)
+            return
+
         # ── 控制策略选择 ────────────────────────────────────────────────
-        if self.mode == 'EDGE_FOLLOW':
+        # U-Turn 区间内用 Pure Pursuit，其他情况用 Stanley
+        if self._is_in_uturn():
+            v, omega = self._pure_pursuit_track(rx, ry, ryaw)
+        elif self.mode == 'EDGE_FOLLOW':
             v, omega = self._edge_follow_pd()
         else:
             v, omega = self._stanley_track(rx, ry, ryaw, rv)
@@ -315,6 +367,9 @@ class ControllerNode(Node):
 
         self._log_v = v
         self._log_w = omega
+        # PP 模式下强制 0.2 硬上限（U-turn 时允许蹭过去）
+        if self._is_in_uturn():
+            v = 0.2
         cmd.linear.x  = float(v)
         cmd.angular.z = float(omega)
         self.pub_cmd.publish(cmd)
@@ -325,11 +380,64 @@ class ControllerNode(Node):
         if len(pts) < 5:
             return False
         idx = self.ref_idx_hint
-        for offset in (4, 6, 8, 10):
+        offsets = [3, 6, 10, 14]  # 直线段: 1.5m~7m 预警; 弧段: 0.5m~2.3m 触发 PP
+        for offset in offsets:
             ci = min(len(pts) - 1, idx + offset)
-            if abs(self._estimate_curvature(ci)) > 0.25:
+            kappa = abs(self._estimate_curvature(ci))
+            if kappa > 0.10:
                 return True
         return False
+
+    def _is_in_uturn(self) -> bool:
+        """检测当前是否处于 U-Turn 区间内（而不仅是即将到来）。"""
+        pts = self.ref
+        if len(pts) < 5:
+            return False
+        idx = self.ref_idx_hint
+        total_kappa = 0.0
+        count = 0
+        for delta in range(-3, 4):
+            ci = min(len(pts) - 1, max(0, idx + delta))
+            total_kappa += abs(self._estimate_curvature(ci))
+            count += 1
+        avg_kappa = total_kappa / count
+        return avg_kappa > 0.3
+
+    def _pure_pursuit_track(self, rx, ry, ryaw):
+        """Pure Pursuit：朝 look-ahead 点 steering，保证走规划路径。"""
+        pts = self.ref
+        n   = len(pts)
+        idx = self.ref_idx_hint
+
+        L_DA = 0.6  # look-ahead 距离（U-turn 时用短距离，更精准）
+
+        best_d  = float('inf')
+        best_i  = idx
+        search_lo = max(0, idx - 5)
+        search_hi = min(n - 1, idx + 50)
+        for i in range(search_lo, search_hi + 1):
+            d = math.hypot(rx - pts[i][0], ry - pts[i][1])
+            if d < best_d:
+                best_d = d
+                best_i = i
+
+        la_i = best_i
+        for i in range(best_i, min(n - 1, best_i + 50)):
+            d = math.hypot(rx - pts[i][0], ry - pts[i][1])
+            if d >= L_DA:
+                la_i = i
+                break
+
+        lx, ly, _ = pts[la_i]
+        dx = lx - rx
+        dy = ly - ry
+        alpha = wrap(math.atan2(dy, dx) - ryaw)
+        delta = math.atan2(2.0 * self.L * math.sin(alpha), L_DA)
+        delta = max(-self.delta_max, min(self.delta_max, delta))
+
+        v = 0.2  # U-turn 目标速度：0.2 m/s
+        omega = v * math.tan(delta) / self.L
+        return v, omega
 
     # ── 5 秒状态日志 ─────────────────────────────────────────────────
     def _log_status(self):
@@ -453,6 +561,11 @@ class ControllerNode(Node):
         # URDF tricycle_drive 插件期望 ω = v × tan(δ) / L
         # 其中 L = wheel_base = 1.05m（前后轴中心距）
         omega = v_sched * math.tan(delta) / self.L
+
+        # ── 弯道预警降速（不等 PP 触发，提前降速）────────────────────────
+        if self._has_upcoming_turn():
+            v_sched *= 0.3   # 预警阶段主动降速 70%，提前约 3s 开始减速
+
         return v_sched, omega
 
     def _estimate_curvature(self, idx: int) -> float:
