@@ -85,7 +85,7 @@ ros2 launch sweeper_bringup sweeper_sim.launch.py
 | Topic | 类型 | 方向 | 说明 |
 |---|---|---|---|
 | `/scan`                 | sensor_msgs/LaserScan | gazebo → perception | 主雷达 |
-| `/odom`                 | nav_msgs/Odometry     | gazebo → * | 里程计（diff_drive 插件发布） |
+| `/odom`                 | nav_msgs/Odometry     | gazebo → * | 里程计（tricycle_drive_fixed 插件发布） |
 | `/cmd_vel`              | geometry_msgs/Twist   | control → gazebo | `linear.x` + `angular.z` |
 | `/coverage/path`        | nav_msgs/Path         | coverage → planner (latched) | 全场清扫参考路径 |
 | `/coverage/markers`     | visualization_msgs/MarkerArray | → RViz | 绿色折线 |
@@ -134,14 +134,14 @@ ros2 launch sweeper_bringup sweeper_sim.launch.py
 * **车不走**：看 `/behavior/mode`；若一直 `STOP` 说明 `/planner/blocked=true`。看 `/perception/obstacle_points` 是否有异常近点。可临时放大 `corridor_half_width`。
 * **雷达扫到车身**：本车 URDF 的雷达 z=0.6 m 低于车顶；如需更远可改 xacro 中 `laser_joint.origin.z`。
 * **`tf_transformations` 找不到**：`sudo apt install ros-humble-tf-transformations`。
-* **和真车 SDK 冲突**：真车节点（`mc`, `rtk`, `rslidar_sdk`）监听 CAN/串口，与仿真独立。仿真 `/cmd_vel` 默认由 diff_drive 插件消费。真车上把 `controller_node` 的 `/cmd_vel` remap 到底盘桥即可。
+* **和真车 SDK 冲突**：真车节点（`mc`, `rtk`, `rslidar_sdk`）监听 CAN/串口，与仿真独立。仿真 `/cmd_vel` 默认由 tricycle_drive_fixed 插件消费。真车上把 `controller_node` 的 `/cmd_vel` remap 到底盘桥即可。
 
 ---
 
 ## 与真车（SDK/ 目录）的对接点
 
 1. `mc` 包提供 CAN 底盘控制 → 新写一个 `mc_bridge` 节点订阅 `/cmd_vel` 并发布 `sweeper_interfaces/McCtrl`。
-2. `rtk` 定位 → 写一个 `rtk_to_odom` 节点，把 RTK 经纬度映射为 UTM 并发布 `/odom` + `map→odom` TF，替代仿真里 diff_drive 的 odom 源。
+2. `rtk` 定位 → 写一个 `rtk_to_odom` 节点，把 RTK 经纬度映射为 UTM 并发布 `/odom` + `map→odom` TF，替代仿真里 tricycle_drive_fixed 的 odom 源。
 3. `rslidar_sdk` → 发布 PointCloud2。需要额外加一个 `pointcloud_to_laserscan` 节点将其降维到 `/scan`，或把 `perception_node` 改成直接消费 PC2。
 
 这些适配不影响仿真栈，保留接口整齐。

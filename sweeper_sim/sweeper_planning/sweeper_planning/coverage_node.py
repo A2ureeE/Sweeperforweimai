@@ -237,18 +237,16 @@ class CoverageNode(Node):
                 pts.append((float(x), float(y)))
 
             if idx + 1 < len(ys):
-                # U 形弯：弧中心在行尾上方 arc_R 处
-                # arc_R = eff_spacing/2 → 弧终点 = y + 2*arc_R = y + eff_spacing
-                # 即恰好落在下一行起点 ✓
-                # 弧最右点 = x_end + arc_R ≤ ix_max + arc_R = xmax - eff_edge + arc_R
-                # = xmax - (turn_r+0.15) + (turn_r+0.025) = xmax - 0.125 ✓ 不超界
                 if going_right:
+                    # 右侧 U-turn：弧心 (x_end, y+arc_R)，向右凸出
                     arc = _arc_pts(x_end, y + arc_R, arc_R,
                                    -math.pi / 2, math.pi / 2, 18)
                 else:
-                    arc = list(reversed(
-                        _arc_pts(x_start, y + arc_R, arc_R,
-                                 -math.pi / 2, math.pi / 2, 18)))
+                    # 左侧 U-turn：弧心 (x_end, y+arc_R)，向左凸出
+                    # 角度从 -π/2 经过 -π 到 -3π/2，即从行末 (x_end,y)
+                    # 绕左侧到达下一行起点 (x_end, y+eff_spacing)
+                    arc = _arc_pts(x_end, y + arc_R, arc_R,
+                                   -math.pi / 2, -3 * math.pi / 2, 18)
                 pts.extend(arc)
 
         return pts

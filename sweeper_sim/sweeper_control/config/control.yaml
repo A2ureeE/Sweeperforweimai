@@ -16,6 +16,11 @@ controller_node:
     wall_dist_ref:        0.35
     kp_wall:              0.5
     kd_wall:              0.1
+    obstacle_slow_dist:   0.8
+    obstacle_steer_dist:  0.5
+    obstacle_stop_dist:   0.3
+    front_scan_half_angle_deg: 30.0
+    avoidance_omega_gain: 0.5
 
 mpc_controller_node:
   ros__parameters:

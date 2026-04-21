@@ -107,7 +107,13 @@ class PlannerNode(Node):
         self._stag_start_t   = time.time()
         self._last_stag_pos  = None
 
+        # 避障后回归原路径
+        self._prev_mode             = 'COVERAGE'
+        self._detour_start_idx      = None
+        self._returning_from_detour = False
+
         self.create_timer(0.2, self.tick)
+        self.create_timer(5.0, self._log_status)
         self.get_logger().info('planner_node ready (gate + dynamic detour enabled)')
 
     # ── 回调 ────────────────────────────────────────────────────────────
@@ -180,9 +186,30 @@ class PlannerNode(Node):
         n   = len(self.cov_pts)
         pts = np.array(self.cov_pts)
 
+        # ── 避障模式切换检测：保存/恢复路径位置 ──────────────────────
+        detour_modes = ('STATIC_DETOUR', 'DYNAMIC_AVOID')
+        entering_detour = (self.mode in detour_modes
+                           and self._prev_mode not in detour_modes)
+        leaving_detour  = (self.mode not in detour_modes
+                           and self._prev_mode in detour_modes)
+
+        if entering_detour and self._detour_start_idx is None:
+            self._detour_start_idx = self.progress_idx
+            self.get_logger().info(
+                f'进入避障模式，保存路径位置 idx={self.progress_idx}')
+
+        if leaving_detour and self._detour_start_idx is not None:
+            if self._detour_start_idx < self.progress_idx - 3:
+                self.get_logger().info(
+                    f'避障结束，回退至原路径: '
+                    f'idx {self.progress_idx}→{self._detour_start_idx}')
+                self.progress_idx = self._detour_start_idx
+                self._returning_from_detour = True
+            self._detour_start_idx = None
+
+        self._prev_mode = self.mode
+
         # ── 前向滑动窗口找最近点 ────────────────────────────────────
-        # 窗口限制为 10 点（5m），防止因偏离路径而跳入下一行
-        # 首次运行时（冷启动）在整条路径内全局搜索
         if self.progress_idx == 0:
             d2      = np.sum((pts - np.array([rx, ry])) ** 2, axis=1)
             new_idx = int(np.argmin(d2))
@@ -191,8 +218,19 @@ class PlannerNode(Node):
                 f'Path接入点: idx={new_idx}, '
                 f'pos=({pts[new_idx][0]:.1f},{pts[new_idx][1]:.1f}), '
                 f'dist={math.sqrt(d2[new_idx]):.2f}m')
+        elif self._returning_from_detour:
+            window_end = min(n - 1, self.progress_idx + 50)
+            sub  = pts[self.progress_idx: window_end + 1]
+            d2   = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
+            nearest_in_window = int(np.argmin(d2))
+            new_idx = self.progress_idx + nearest_in_window
+            nearest_dist = math.sqrt(d2[nearest_in_window])
+            self.progress_idx = max(self.progress_idx, new_idx)
+            if nearest_dist < 1.5:
+                self._returning_from_detour = False
+                self.get_logger().info(
+                    f'已回到原路径, dist={nearest_dist:.2f}m')
         else:
-            # 每帧最多前进 10 点（5m）；机器人实际每帧移动 ~0.16m
             window_end = min(n - 1, self.progress_idx + 10)
             sub  = pts[self.progress_idx: window_end + 1]
             d2   = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
@@ -250,6 +288,22 @@ class PlannerNode(Node):
             slice_pts = self._apply_dynamic_detour(slice_pts, rx, ry, ryaw)
 
         self._publish_path(slice_pts)
+
+    # ── 5 秒状态日志 ─────────────────────────────────────────────────────
+    def _log_status(self):
+        if self.robot is None:
+            return
+        rx, ry, ryaw = self.robot
+        n = len(self.cov_pts)
+        pct = self.progress_idx / max(1, n - 1) * 100 if n > 1 else 0
+        self.get_logger().info(
+            f'[规划] 模式={self.mode} | '
+            f'路径进度={self.progress_idx}/{n} ({pct:.1f}%) | '
+            f'静态障碍记忆={len(self.obs_memory)}个 '
+            f'动态障碍={len(self.dyn_obstacles)}个 | '
+            f'窄门={"检测到" if self.gate_pose else "无"} | '
+            f'停滞累积={self._stag_accum_d:.2f}m | '
+            f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}°')
 
     # ── 穿门路径生成 ─────────────────────────────────────────────────────
     def _build_gate_path(self, rx, ry, ryaw) -> list:

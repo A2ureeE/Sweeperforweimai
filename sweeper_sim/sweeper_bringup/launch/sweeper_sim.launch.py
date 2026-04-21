@@ -18,9 +18,11 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
                              TimerAction)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 # ─────────────────────────────────────────────
@@ -92,7 +94,8 @@ def generate_launch_description():
 
     # ── Declare launch arguments ──────────────────────────────────────
     gui_arg  = DeclareLaunchArgument('gui',  default_value='true')
-    rviz_arg = DeclareLaunchArgument('rviz', default_value='false')
+    rviz_arg = DeclareLaunchArgument('rviz', default_value='true')
+    edge_follow_arg = DeclareLaunchArgument('enable_edge_follow', default_value='false')
 
     # ── 1. Gazebo + robot ─────────────────────────────────────────────
     world_file = os.path.join(
@@ -121,7 +124,15 @@ def generate_launch_description():
     behavior_node = Node(
         package='sweeper_behavior', executable='behavior_node',
         name='behavior_node',
-        parameters=[cfg_behavior, {'use_sim_time': True}],
+        parameters=[
+            cfg_behavior,
+            map_params,
+            {
+                'enable_edge_follow': ParameterValue(
+                    LaunchConfiguration('enable_edge_follow'),
+                    value_type=bool)
+            }
+        ],
         output='screen')
 
     coverage_node = Node(
@@ -139,7 +150,7 @@ def generate_launch_description():
     controller_node = Node(
         package='sweeper_control', executable='controller_node',
         name='controller_node',
-        parameters=[cfg_control, {'use_sim_time': True}],
+        parameters=[cfg_control, map_params],
         output='screen')
 
     # ── 3. Score / mission nodes ──────────────────────────────────────
@@ -153,6 +164,15 @@ def generate_launch_description():
         package='sweeper_planning', executable='mission_runner_node',
         name='mission_runner_node',
         parameters=[cfg_planning, gate_params],   # gate_params from map
+        output='screen')
+
+    # ── 4. RViz2 (conditional) ─────────────────────────────────────────
+    rviz_config = os.path.join(pkg_bringup, 'rviz', 'sweeper.rviz')
+    rviz_node = Node(
+        package='rviz2', executable='rviz2', name='rviz2',
+        arguments=['-d', rviz_config],
+        parameters=[{'use_sim_time': True}],
+        condition=IfCondition(LaunchConfiguration('rviz')),
         output='screen')
 
     # ── Launch sequence ───────────────────────────────────────────────
@@ -176,7 +196,9 @@ def generate_launch_description():
     return LaunchDescription([
         gui_arg,
         rviz_arg,
+        edge_follow_arg,
         gazebo_launch,
+        rviz_node,
         delayed_nodes,
         delayed_loggers,
     ])

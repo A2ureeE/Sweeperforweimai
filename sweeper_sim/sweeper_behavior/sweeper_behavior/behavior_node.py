@@ -46,11 +46,17 @@ class BehaviorNode(Node):
     def __init__(self):
         super().__init__('behavior_node')
         self.declare_parameters('', [
+            ('area_x_min',            -12.0),
+            ('area_x_max',             14.5),
+            ('area_y_min',             -9.0),
+            ('area_y_max',              9.5),
+            ('wall_filter_margin',      0.5),
             ('emergency_brake_dist',  0.35),
             ('dynamic_avoid_dist',    1.8),
             ('static_detour_dist',    1.2),
             ('narrow_gate_dist',      3.0),
             ('edge_follow_dist',      0.55),
+            ('enable_edge_follow',    False),
             ('edge_follow_front_deg', 60.0),   # front cone to check for edge
             ('wall_scan_angle_deg',  30.0),
             ('normal_speed',          0.8),
@@ -60,11 +66,17 @@ class BehaviorNode(Node):
             ('gate_hysteresis_frames', 3),
         ])
         g = self.get_parameter
+        self.area_x_min      = g('area_x_min').value
+        self.area_x_max      = g('area_x_max').value
+        self.area_y_min      = g('area_y_min').value
+        self.area_y_max      = g('area_y_max').value
+        self.wall_filter_margin = g('wall_filter_margin').value
         self.emerg_dist      = g('emergency_brake_dist').value
         self.dyn_dist        = g('dynamic_avoid_dist').value
         self.static_dist     = g('static_detour_dist').value
         self.gate_dist       = g('narrow_gate_dist').value
         self.edge_dist       = g('edge_follow_dist').value
+        self.enable_edge_follow = g('enable_edge_follow').value
         self.edge_front_deg  = math.radians(g('edge_follow_front_deg').value)
         self.wall_angle      = math.radians(g('wall_scan_angle_deg').value)
         self.normal_speed    = g('normal_speed').value
@@ -104,7 +116,11 @@ class BehaviorNode(Node):
         self._gate_frames     = 0
         self._gate_active     = False
 
+        self._last_mode  = 'COVERAGE'
+        self._last_speed = self.normal_speed
+
         self.create_timer(0.1, self.tick)
+        self.create_timer(5.0, self._log_status)
         self.get_logger().info('behavior_node ready')
 
     # ── 回调 ────────────────────────────────────────────────────────────
@@ -146,12 +162,31 @@ class BehaviorNode(Node):
         """前方 ±30° 扇区最小测距（激光帧）。"""
         if not self.scan_ranges:
             return 999.0
+        rx, ry = self._robot_pos
+        ryaw = self.robot_yaw
         best = 999.0
         for i, r in enumerate(self.scan_ranges):
+            if not (0.05 < r < 20.0):
+                continue
             angle = self.scan_angle_min + i * self.scan_angle_inc
-            if abs(angle) <= self.wall_angle and 0.05 < r < 20.0:
-                best = min(best, r)
+            if abs(angle) > self.wall_angle:
+                continue
+            # 避障层忽略墙壁，墙壁由规划与贴边逻辑负责
+            wx = rx + r * math.cos(angle + ryaw)
+            wy = ry + r * math.sin(angle + ryaw)
+            if self._is_wall_point(wx, wy):
+                continue
+            best = min(best, r)
         return best
+
+    def _is_wall_point(self, wx: float, wy: float) -> bool:
+        m = self.wall_filter_margin
+        return (
+            abs(wx - self.area_x_min) <= m or
+            abs(wx - self.area_x_max) <= m or
+            abs(wy - self.area_y_min) <= m or
+            abs(wy - self.area_y_max) <= m
+        )
 
     def _nearest_static_dist(self) -> float:
         """最近静态障碍物到机器人的真实欧氏距离（世界坐标→机器人坐标）。"""
@@ -243,10 +278,11 @@ class BehaviorNode(Node):
                 speed_lim = self.detour_speed
 
         # ⑤ 贴边清扫（侧向有墙时触发）
-        if mode == 'COVERAGE' and self._near_wall():
+        if self.enable_edge_follow and mode == 'COVERAGE' and self._near_wall():
             mode      = 'EDGE_FOLLOW'
             speed_lim = self.normal_speed * 0.7
-            # 发布靠哪侧（供 controller 选择参考壁）
+            self._last_mode  = mode
+            self._last_speed = speed_lim
             right_d, left_d = self._nearest_wall_side_dist()
             side = 'right' if right_d < left_d else 'left'
             self.pub_mode.publish(String(data=f'EDGE_FOLLOW_{side}'))
@@ -256,8 +292,25 @@ class BehaviorNode(Node):
         self._publish(mode, speed_lim)
 
     def _publish(self, mode: str, speed: float):
+        self._last_mode  = mode
+        self._last_speed = speed
         self.pub_mode.publish(String(data=mode))
         self.pub_speed.publish(Float32(data=float(speed)))
+
+    # ── 5 秒状态日志 ─────────────────────────────────────────────────────
+    def _log_status(self):
+        front_d  = self._front_clear_dist()
+        static_d = self._nearest_static_dist()
+        dyn_d    = self._nearest_dynamic_dist()
+        near_w   = self._near_wall()
+        rx, ry   = self._robot_pos
+        self.get_logger().info(
+            f'[行为] 模式={self._last_mode} 限速={self._last_speed:.2f} | '
+            f'前方={front_d:.2f}m 最近静态={static_d:.2f}m 最近动态={dyn_d:.2f}m | '
+            f'靠墙={"是" if near_w else "否"} '
+            f'贴边开关={"开" if self.enable_edge_follow else "关"} '
+            f'窄门={"激活" if self._gate_active else "未激活"} | '
+            f'位置=({rx:.1f},{ry:.1f})')
 
 
 def main():

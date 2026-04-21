@@ -2,10 +2,9 @@
 Robot description launch.
 
 Publishes robot_description via robot_state_publisher.
-Uses z200.urdf.xacro (derived from the official z200.urdf with the
-unavailable libgazebo_ros_tricycle_drive_fixed.so swapped for the
-standard libgazebo_ros_diff_drive.so — the original z200.urdf is
-never modified).
+Uses z200.urdf.xacro (Ackermann tricycle drive model via
+libgazebo_ros_tricycle_drive_fixed.so — front wheel steering,
+rear wheel drive).
 """
 import os
 from ament_index_python.packages import get_package_share_directory

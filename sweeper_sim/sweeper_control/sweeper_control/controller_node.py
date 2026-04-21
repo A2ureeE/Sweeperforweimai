@@ -47,8 +47,14 @@ class ControllerNode(Node):
     def __init__(self):
         super().__init__('controller_node')
         self.declare_parameters('', [
+            ('area_x_min',              -12.0),
+            ('area_x_max',               14.5),
+            ('area_y_min',               -9.0),
+            ('area_y_max',                9.5),
+            ('wall_filter_margin',        0.3),
             ('control_rate_hz',         10.0),
             ('wheel_base',               1.05),
+            ('wheel_separation',         1.048),  # Gazebo URDF 中左右轮间距，用于 diff_drive
             ('max_steer_angle',          0.8727),   # ~50°
             ('max_angular_rate',         0.9),
             ('target_speed',             0.8),
@@ -70,9 +76,21 @@ class ControllerNode(Node):
             # 侧向扫描角度范围（激光帧，度）
             ('side_scan_angle_min_deg',  70.0),
             ('side_scan_angle_max_deg', 110.0),
+            # 前方反应式避障
+            ('obstacle_slow_dist',       0.8),
+            ('obstacle_steer_dist',      0.5),
+            ('obstacle_stop_dist',       0.3),
+            ('front_scan_half_angle_deg', 30.0),
+            ('avoidance_omega_gain',     0.5),
         ])
         g = self.get_parameter
+        self.area_x_min = g('area_x_min').value
+        self.area_x_max = g('area_x_max').value
+        self.area_y_min = g('area_y_min').value
+        self.area_y_max = g('area_y_max').value
+        self.wall_filter_margin = g('wall_filter_margin').value
         self.L          = g('wheel_base').value
+        self.w_sep     = g('wheel_separation').value
         self.delta_max  = g('max_steer_angle').value
         self.w_max      = g('max_angular_rate').value
         self.v_target   = g('target_speed').value
@@ -89,6 +107,11 @@ class ControllerNode(Node):
         self.kd_wall    = g('kd_wall').value
         self.side_a_min = math.radians(g('side_scan_angle_min_deg').value)
         self.side_a_max = math.radians(g('side_scan_angle_max_deg').value)
+        self.obs_slow_d    = g('obstacle_slow_dist').value
+        self.obs_steer_d   = g('obstacle_steer_dist').value
+        self.obs_stop_d    = g('obstacle_stop_dist').value
+        self.front_half    = math.radians(g('front_scan_half_angle_deg').value)
+        self.avoid_gain    = g('avoidance_omega_gain').value
         self.dt         = 1.0 / g('control_rate_hz').value
 
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -121,7 +144,14 @@ class ControllerNode(Node):
         # 壁面 PD 状态
         self._wall_err_prev = 0.0
 
+        # 状态日志（每 5s 输出一次）
+        self._log_v = 0.0
+        self._log_w = 0.0
+        self._log_front_d = 999.0
+        self._log_avoid = 'none'
+
         self.create_timer(self.dt, self.tick)
+        self.create_timer(5.0, self._log_status)
         self.get_logger().info('controller_node ready')
 
     # ── 回调 ────────────────────────────────────────────────────────────
@@ -129,7 +159,7 @@ class ControllerNode(Node):
         self.ref = [(p.pose.position.x, p.pose.position.y,
                      yaw_from_quat(p.pose.orientation))
                     for p in msg.poses]
-        self.ref_idx_hint = max(0, min(self.ref_idx_hint, len(self.ref) - 1))
+        self.ref_idx_hint = 0
 
     def cb_odom(self, msg: Odometry):
         x   = msg.pose.pose.position.x
@@ -185,30 +215,46 @@ class ControllerNode(Node):
                     self.mode in ('COVERAGE', 'STATIC_DETOUR')):
                 stuck = True
 
-        # ── 恢复逻辑 ────────────────────────────────────────────────────
+        # ── 恢复逻辑（前方有障碍时后退转向，无障碍时前进）──────────────
         if self._recovering:
             if now < self._rec_end_t:
-                cmd.linear.x  = float(self.rec_spd)
-                cmd.angular.z = 0.0
+                fd, sd = self._front_obstacle_info()
+                if fd < self.obs_steer_d:
+                    cmd.linear.x  = float(-self.rec_spd * 0.5)
+                    cmd.angular.z = float(sd * 0.4)
+                else:
+                    cmd.linear.x  = float(self.rec_spd)
+                    cmd.angular.z = 0.0
                 self.pub_cmd.publish(cmd)
                 return
             else:
                 self._recovering = False
-                self.ref_idx_hint = min(len(self.ref) - 1,
-                                        self.ref_idx_hint + 8)
+                self.ref_idx_hint = 0
                 self._pos_history.clear()
 
         if stuck and not self._recovering:
-            self.get_logger().warn('Stuck 检测触发 — 直行恢复')
+            self.get_logger().warn('Stuck 检测触发 — 恢复模式')
             self._recovering = True
             self._rec_end_t  = now + self.rec_hold
-            cmd.linear.x  = float(self.rec_spd)
-            cmd.angular.z = 0.0
+            fd, sd = self._front_obstacle_info()
+            if fd < self.obs_steer_d:
+                cmd.linear.x  = float(-self.rec_spd * 0.5)
+                cmd.angular.z = float(sd * 0.4)
+            else:
+                cmd.linear.x  = float(self.rec_spd)
+                cmd.angular.z = 0.0
             self.pub_cmd.publish(cmd)
             return
 
-        # ── STOP 模式 ──────────────────────────────────────────────────
+        # ── STOP 模式（主动避让，不再呆站）──────────────────────────────
         if self.mode == 'STOP' or self.speed_limit <= 0.0:
+            front_d, steer_dir = self._front_obstacle_info()
+            if front_d < self.obs_slow_d:
+                cmd.linear.x  = float(-self.rec_spd * 0.5)
+                cmd.angular.z = float(steer_dir * self.w_max * 0.6)
+                self.get_logger().warn(
+                    f'STOP模式主动避让: front={front_d:.2f}m, 后退+转向',
+                    throttle_duration_sec=1.0)
             self.pub_cmd.publish(cmd)
             return
 
@@ -226,18 +272,122 @@ class ControllerNode(Node):
         # 应用速度限制
         v = min(v, self.speed_limit)
 
-        # 先确定最终速度，再计算运动学约束
-        if abs(omega) > 0.05:
-            v = max(v, self.v_min)
+        # 前方障碍物反应式避障（路径弯道时抑制，避免干扰 U-turn）
+        front_d, steer_dir = self._front_obstacle_info()
+        self._log_front_d = front_d
+        turning = self._has_upcoming_turn()
+        eff_stop  = self.obs_stop_d  * (0.4 if turning else 1.0)
+        eff_steer = self.obs_steer_d * (0.4 if turning else 1.0)
+        eff_slow  = self.obs_slow_d  * (0.5 if turning else 1.0)
 
-        # 运动学约束：|omega| ≤ v·tan(δ_max)/L
+        emergency_stop = False
+        avoid_label = 'none'
+        if front_d < eff_stop:
+            v = 0.0
+            omega = steer_dir * self.avoid_gain
+            emergency_stop = True
+            avoid_label = 'STOP'
+            self.get_logger().warn(
+                f'前方障碍 {front_d:.2f}m — 紧急转向',
+                throttle_duration_sec=1.0)
+        elif front_d < eff_steer:
+            t = (front_d - eff_stop) / max(0.01, eff_steer - eff_stop)
+            v *= t
+            v = max(v, self.v_min * 0.3)
+            avoid_w = steer_dir * self.avoid_gain * (1.0 - t)
+            omega = omega * t + avoid_w
+            avoid_label = 'steer'
+        elif front_d < eff_slow:
+            t = (front_d - eff_steer) / max(0.01, eff_slow - eff_steer)
+            v *= (0.5 + 0.5 * t)
+            avoid_label = 'slow'
+        self._log_avoid = avoid_label
+
+        # 运动学约束（Ackermann 模型：omega = v × tan(δ) / L）
         omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
-        omega = max(-min(self.w_max, omega_kin_max),
-                    min(min(self.w_max, omega_kin_max), omega))
+        if emergency_stop:
+            omega = max(-self.w_max, min(self.w_max, omega))
+        else:
+            if abs(omega) > 0.05:
+                v = max(v, self.v_min)
+            omega = max(-min(self.w_max, omega_kin_max),
+                        min(min(self.w_max, omega_kin_max), omega))
 
+        self._log_v = v
+        self._log_w = omega
         cmd.linear.x  = float(v)
         cmd.angular.z = float(omega)
         self.pub_cmd.publish(cmd)
+
+    # ── 路径弯道检测（U-turn 即将到来时抑制避障）───────────────────────
+    def _has_upcoming_turn(self) -> bool:
+        pts = self.ref
+        if len(pts) < 5:
+            return False
+        idx = self.ref_idx_hint
+        for offset in (4, 6, 8, 10):
+            ci = min(len(pts) - 1, idx + offset)
+            if abs(self._estimate_curvature(ci)) > 0.25:
+                return True
+        return False
+
+    # ── 5 秒状态日志 ─────────────────────────────────────────────────
+    def _log_status(self):
+        if self.robot is None:
+            return
+        rx, ry, ryaw, rv = self.robot
+        turn = self._has_upcoming_turn()
+        self.get_logger().info(
+            f'[控制] 模式={self.mode} | '
+            f'指令速度={self._log_v:.2f} 指令角速度={self._log_w:.2f} '
+            f'实际速度={rv:.2f} | '
+            f'前方距离={self._log_front_d:.2f}m 避障状态={self._log_avoid} '
+            f'弯道预判={"是" if turn else "否"} | '
+            f'参考路径点数={len(self.ref)} 跟踪索引={self.ref_idx_hint} | '
+            f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}°')
+
+    # ── 前方障碍物扫描 ─────────────────────────────────────────────────
+    def _front_obstacle_info(self):
+        """扫描前方锥形区域，返回 (最小距离, 转向方向)。
+        转向方向: +1 = 向左转 (omega>0), -1 = 向右转（朝更开阔的一侧）。
+        近距离障碍物自动扩大检测角度以覆盖车身宽度。
+        """
+        if not self.scan_ranges:
+            return 999.0, 0.0
+        if self.robot is None:
+            return 999.0, 0.0
+        rx, ry, ryaw, _ = self.robot
+        min_dist  = 999.0
+        left_min  = 999.0
+        right_min = 999.0
+        for i, r in enumerate(self.scan_ranges):
+            if not (0.05 < r < 10.0):
+                continue
+            angle = self.scan_angle_min + i * self.scan_angle_inc
+            if abs(angle) > self.front_half:
+                continue
+            # 避障层忽略墙壁回波，墙壁由规划层和贴边控制处理
+            wx = rx + r * math.cos(angle + ryaw)
+            wy = ry + r * math.sin(angle + ryaw)
+            if self._is_wall_point(wx, wy):
+                continue
+            if r < min_dist:
+                min_dist = r
+            if angle >= 0:
+                left_min = min(left_min, r)
+            else:
+                right_min = min(right_min, r)
+        steer_dir = 1.0 if right_min < left_min else -1.0
+        return min_dist, steer_dir
+
+    def _is_wall_point(self, wx: float, wy: float) -> bool:
+        m = self.wall_filter_margin
+        return (
+            abs(wx - self.area_x_min) <= m or
+            abs(wx - self.area_x_max) <= m or
+            abs(wy - self.area_y_min) <= m or
+            abs(wy - self.area_y_max) <= m
+        )
 
     # ── Stanley 路径跟踪 ─────────────────────────────────────────────────
     def _stanley_track(self, rx, ry, ryaw, rv):
@@ -254,6 +404,13 @@ class ControllerNode(Node):
             if d < best_d:
                 best_d = d
                 best_i = lo + i
+
+        if best_d > 2.0:
+            for i, (px, py, _) in enumerate(pts):
+                d = math.hypot(rx - px, ry - py)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
 
         if best_i > self.ref_idx_hint:
             self.ref_idx_hint = best_i
@@ -284,6 +441,17 @@ class ControllerNode(Node):
         v_sched = self.v_target / (1.0 + self.curv_gain * abs(kappa))
         v_sched = max(self.v_min, v_sched)
 
+        # ── 曲率速度调度 ─────────────────────────────────────────────────
+        # 急弯时（kappa 较大）降低速度，确保角速度不超过物理极限
+        omega_max_diff = self.v_target * math.tan(self.delta_max) / self.L
+        kappa_abs = abs(kappa)
+        if kappa_abs > 1e-4:
+            v_needed = omega_max_diff / kappa_abs
+            v_sched = max(v_sched, min(self.v_min * 1.5, v_needed))
+
+        # ── 角速度（ω）计算 ───────────────────────────────────────────────
+        # URDF tricycle_drive 插件期望 ω = v × tan(δ) / L
+        # 其中 L = wheel_base = 1.05m（前后轴中心距）
         omega = v_sched * math.tan(delta) / self.L
         return v_sched, omega
 

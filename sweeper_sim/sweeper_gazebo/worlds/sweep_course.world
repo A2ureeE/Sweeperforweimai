@@ -34,15 +34,16 @@
     </model>
 
     <!-- ===================== BOUNDARY WALLS ===================== -->
-    <!-- Area: x=-12~14.5, y=-9~9.5, wall height=0.5m, thickness=0.1m -->
+    <!-- Area: x=-12~14.5, y=-9~9.5, wall height=1.2m, thickness=0.1m -->
+    <!-- Laser is at z=0.975m, walls must be taller than that -->
 
     <!-- South wall (y=-9) -->
     <model name="wall_south">
       <static>true</static>
-      <pose>1.25 -9.05 0.25 0 0 0</pose>
+      <pose>1.25 -9.05 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><box><size>26.6 0.1 0.5</size></box></geometry></collision>
-        <visual name="vis"><geometry><box><size>26.6 0.1 0.5</size></box></geometry>
+        <collision name="col"><geometry><box><size>26.6 0.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>26.6 0.1 1.2</size></box></geometry>
           <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
       </link>
     </model>
@@ -50,10 +51,10 @@
     <!-- North wall (y=9.5) -->
     <model name="wall_north">
       <static>true</static>
-      <pose>1.25 9.55 0.25 0 0 0</pose>
+      <pose>1.25 9.55 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><box><size>26.6 0.1 0.5</size></box></geometry></collision>
-        <visual name="vis"><geometry><box><size>26.6 0.1 0.5</size></box></geometry>
+        <collision name="col"><geometry><box><size>26.6 0.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>26.6 0.1 1.2</size></box></geometry>
           <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
       </link>
     </model>
@@ -61,10 +62,10 @@
     <!-- West wall (x=-12) -->
     <model name="wall_west">
       <static>true</static>
-      <pose>-12.05 0.25 0.25 0 0 0</pose>
+      <pose>-12.05 0.25 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><box><size>0.1 18.6 0.5</size></box></geometry></collision>
-        <visual name="vis"><geometry><box><size>0.1 18.6 0.5</size></box></geometry>
+        <collision name="col"><geometry><box><size>0.1 18.6 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.1 18.6 1.2</size></box></geometry>
           <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
       </link>
     </model>
@@ -72,87 +73,87 @@
     <!-- East wall (x=14.5) -->
     <model name="wall_east">
       <static>true</static>
-      <pose>14.55 0.25 0.25 0 0 0</pose>
+      <pose>14.55 0.25 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><box><size>0.1 18.6 0.5</size></box></geometry></collision>
-        <visual name="vis"><geometry><box><size>0.1 18.6 0.5</size></box></geometry>
+        <collision name="col"><geometry><box><size>0.1 18.6 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.1 18.6 1.2</size></box></geometry>
           <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
       </link>
     </model>
 
     <!-- ===================== STATIC OBSTACLES (cones) ===================== -->
-    <!-- Each cone: cylinder r=0.12, h=0.5, orange -->
+    <!-- Each cone: cylinder r=0.12, h=1.2 (taller than laser at z=0.975m), orange -->
 
     <!-- Cone cluster 1: obstacle avoidance zone ~x=2, y=-3..3 -->
-    <model name="cone_1"><static>true</static><pose>2.0 -3.0 0.25 0 0 0</pose>
+    <model name="cone_1"><static>true</static><pose>2.0 -3.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
       </link>
     </model>
 
-    <model name="cone_2"><static>true</static><pose>4.0 -1.5 0.25 0 0 0</pose>
+    <model name="cone_2"><static>true</static><pose>4.0 -1.5 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
       </link>
     </model>
 
-    <model name="cone_3"><static>true</static><pose>6.0 1.0 0.25 0 0 0</pose>
+    <model name="cone_3"><static>true</static><pose>6.0 1.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
       </link>
     </model>
 
-    <model name="cone_4"><static>true</static><pose>-2.0 2.5 0.25 0 0 0</pose>
+    <model name="cone_4"><static>true</static><pose>-2.0 2.5 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
       </link>
     </model>
 
-    <model name="cone_5"><static>true</static><pose>8.0 -4.0 0.25 0 0 0</pose>
+    <model name="cone_5"><static>true</static><pose>8.0 -4.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
       </link>
     </model>
 
     <!-- ===================== NARROW GATE 1 (y=-8 area, x=3) ===================== -->
     <!-- Gate width = 2.0m, cone pair on each side of robot path -->
-    <model name="gate1_L"><static>true</static><pose>3.0 -7.0 0.25 0 0 0</pose>
+    <model name="gate1_L"><static>true</static><pose>3.0 -7.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
       </link>
     </model>
-    <model name="gate1_R"><static>true</static><pose>3.0 -9.0 0.25 0 0 0</pose>
+    <model name="gate1_R"><static>true</static><pose>3.0 -9.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
       </link>
     </model>
 
     <!-- ===================== NARROW GATE 2 (y=2 area, x=3) ===================== -->
-    <model name="gate2_L"><static>true</static><pose>3.0 3.0 0.25 0 0 0</pose>
+    <model name="gate2_L"><static>true</static><pose>3.0 3.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
       </link>
     </model>
-    <model name="gate2_R"><static>true</static><pose>3.0 1.0 0.25 0 0 0</pose>
+    <model name="gate2_R"><static>true</static><pose>3.0 1.0 0.6 0 0 0</pose>
       <link name="link">
-        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry></collision>
-        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>0.5</length></cylinder></geometry>
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
           <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
       </link>
     </model>
