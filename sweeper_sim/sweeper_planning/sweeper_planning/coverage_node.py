@@ -27,7 +27,7 @@ def yaw_from_quat(q):
     return tft.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
 
 
-def _arc_pts(cx, cy, r, a_start, a_end, n=12):
+def _arc_pts(cx, cy, r, a_start, a_end, n=24):
     angles = np.linspace(a_start, a_end, n)
     return list(zip(cx + r * np.cos(angles), cy + r * np.sin(angles)))
 
@@ -240,13 +240,13 @@ class CoverageNode(Node):
                 if going_right:
                     # 右侧 U-turn：弧心 (x_end, y+arc_R)，向右凸出
                     arc = _arc_pts(x_end, y + arc_R, arc_R,
-                                   -math.pi / 2, math.pi / 2, 18)
+                                   -math.pi / 2, math.pi / 2, 36)
                 else:
                     # 左侧 U-turn：弧心 (x_end, y+arc_R)，向左凸出
                     # 角度从 -π/2 经过 -π 到 -3π/2，即从行末 (x_end,y)
                     # 绕左侧到达下一行起点 (x_end, y+eff_spacing)
                     arc = _arc_pts(x_end, y + arc_R, arc_R,
-                                   -math.pi / 2, -3 * math.pi / 2, 18)
+                                   -math.pi / 2, -3 * math.pi / 2, 36)
                 pts.extend(arc)
 
         return pts
