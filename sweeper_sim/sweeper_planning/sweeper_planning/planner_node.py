@@ -125,7 +125,7 @@ class PlannerNode(Node):
         self._stag_accum_d = 0.0
         self._stag_start_t = time.time()
         self._last_stag_pos = None
-        self.get_logger().info(f'Coverage path received: {len(self.cov_pts)} pts')
+        # get_logger().info(f'Coverage path received: {len(self.cov_pts)} pts')
 
     def cb_odom(self, msg: Odometry):
         self.robot = (msg.pose.pose.position.x,

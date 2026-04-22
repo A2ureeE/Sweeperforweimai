@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="diag_no_walls">
+
+    <!-- Physics: same as sweep_course.world -->
+    <physics type="ode">
+      <real_time_update_rate>1000</real_time_update_rate>
+      <max_step_size>0.002</max_step_size>
+      <real_time_factor>0.0</real_time_factor>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>50</iters>
+          <sor>1.3</sor>
+        </solver>
+      </ode>
+    </physics>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground plane (必须保留，否则车会掉下去) -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <surface><friction><ode><mu>1</mu><mu2>1</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grass</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 占位的 pedestrian 模型（moving_obstacle_node 需要它） -->
+    <!-- 放在远处，不会影响车辆 -->
+    <model name="pedestrian">
+      <pose>50.0 50.0 0.9 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>70.0</mass><inertia><ixx>5</ixx><iyy>5</iyy><izz>2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <collision name="col">
+          <geometry><cylinder><radius>0.3</radius><length>1.8</length></cylinder></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><cylinder><radius>0.3</radius><length>1.8</length></cylinder></geometry>
+          <material><ambient>0.2 0.4 0.8 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

@@ -149,6 +149,14 @@ class ControllerNode(Node):
         # Stuck 检测：滑动窗口存储最近 stuck_win 秒的位置
         self._pos_history: list = []   # [(t, x, y), ...]
 
+        # U-turn 状态机
+        self._in_uturn = False          # 当前是否处于 PP(U-turn) 模式
+        self._uturn_yaw_start = 0.0     # 进入 U-turn 时的初始航向
+        self._uturn_cum_rotation = 0.0  # U-turn 期间累计航向旋转量（rad）
+        self._uturn_logged = False      # 本次进入/退出是否已打印日志
+        self._heading_history: list = []  # [(t, yaw), ...] 航向历史
+        self._idx_history: list = []      # [(t, ref_idx_hint), ...] 路径索引历史
+
         # 恢复状态
         self._recovering  = False
         self._rec_end_t   = 0.0
@@ -159,6 +167,9 @@ class ControllerNode(Node):
         # 状态日志（每 5s 输出一次）
         self._log_v = 0.0
         self._log_w = 0.0
+        self._log_delta = 0.0           # 转向角 delta (rad)
+        self._log_delta_deg = 0.0       # 转向角 (度)
+        self._log_omega_kin_max = 0.0   # 运动学最大角速度
         self._log_in_uturn = False       # 当前是否为 PP 模式
         self._log_omega_raw = 0.0         # omega 钳制前的原始值
         self._log_omega_clamped = False   # omega 是否被 kin 约束钳制
@@ -170,8 +181,21 @@ class ControllerNode(Node):
         self._log_avoid = 'none'
         self._saved_ref_idx = 0     # 避障时保存的路径索引，恢复时使用
 
+        # U-turn 状态机
+        self._in_uturn = False          # 当前是否处于 PP(U-turn) 模式
+        self._uturn_yaw_start = 0.0     # 进入 U-turn 时的初始航向
+        self._uturn_cum_rotation = 0.0 # U-turn 期间累计航向旋转量（rad）
+        self._uturn_logged = False      # 本次进入/退出是否已打印日志
+        self._uturn_stuck_t = 0.0       # PP 卡住开始时间（速度=0）
+        self._uturn_north_t = 0.0       # PP 接近北/南墙时间
+        self._uturn_reversed = False    # PP 期间是否已反转方向
+        # Sticky：入弧后累计旋转监视，避免 entry/exit 振荡
+        self._uturn_entry_t   = 0.0     # 进入 U-turn 的 sim time (s)
+        self._uturn_prev_yaw  = 0.0     # 上一 tick 的 yaw（用于增量累计）
+        self._uturn_signed_cum = 0.0   # U-turn 期间"带符号"累计旋转（可超 ±π）
+
         self.create_timer(self.dt, self.tick)
-        self.create_timer(5.0, self._log_status)
+        self.create_timer(1.0, self._log_status)
         self.get_logger().info('controller_node ready')
 
     # ── 回调 ────────────────────────────────────────────────────────────
@@ -287,8 +311,11 @@ class ControllerNode(Node):
                 self._find_nearest_entry()
                 self.get_logger().info('10s sim 延迟结束，车辆开始行驶')
             else:
-                # 延迟期间主动制动：发 -0.6 m/s 反向速度，对抗 Gazebo 推力
-                cmd.linear.x = -0.6
+                # 延迟期间保持静止（不发任何指令）。
+                # 之前此处发 linear.x=-0.6 是为了"对抗 Gazebo 推力"，但无墙诊断
+                # 显示车辆不受额外推力。反向指令反而把车倒退到 (-5,-8) 导致起点漂移。
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
                 self.pub_cmd.publish(cmd)
                 return
         if self.robot is None:
@@ -305,6 +332,19 @@ class ControllerNode(Node):
         cutoff = now_s - self.stuck_win
         self._pos_history = [(t, x, y) for t, x, y in self._pos_history
                              if t >= cutoff]
+
+        # ── U-turn 检测：航向历史记录 ──────────────────────────────────
+        self._heading_history.append((now_s, ryaw))
+        HEADING_WIN = 8.0
+        cutoff_h = now_s - HEADING_WIN
+        self._heading_history = [(t, y) for t, y in self._heading_history
+                                if t >= cutoff_h]
+
+        # 路径索引历史（用于检测 U-turn 边界卡住）
+        self._idx_history.append((now_s, self.ref_idx_hint))
+        IDX_WIN = 3.0
+        cutoff_i = now_s - IDX_WIN
+        self._idx_history = [(t, i) for t, i in self._idx_history if t >= cutoff_i]
 
         stuck = False
         if len(self._pos_history) >= 3:
@@ -371,31 +411,39 @@ class ControllerNode(Node):
             return
 
         # ── 控制策略选择 ────────────────────────────────────────────────
-        # U-Turn 区间内用 Pure Pursuit，其他情况用 Stanley
+        # U-Turn 区间内用 Pure Pursuit（跟随参考路径），其他情况用 Stanley
         in_uturn = self._is_in_uturn()
-        if in_uturn and not self._was_in_uturn:
+        # DIAG: 追踪 in_uturn 切换，定位振荡源
+        if in_uturn != self._was_in_uturn:
             self.get_logger().info(
-                f'[PP] 进入 U-turn | 位置=({rx:.1f},{ry:.1f}) '
-                f'| 路径索引={self.ref_idx_hint}/{len(self.ref)}',
-                throttle_duration_sec=1.0)
-        if not in_uturn and self._was_in_uturn:
+                f'[DIAG] in_uturn {self._was_in_uturn}→{in_uturn} | '
+                f'pos=({rx:.2f},{ry:.2f}) yaw={math.degrees(ryaw):.0f}° | '
+                f'cum={math.degrees(self._uturn_cum_rotation):.0f}°',
+                throttle_duration_sec=0.0)
+        if not in_uturn and self._was_in_uturn and self._uturn_logged:
+            cum = math.degrees(self._uturn_cum_rotation)
             self.get_logger().info(
-                f'[PP] 退出 U-turn | 位置=({rx:.1f},{ry:.1f})',
+                f'[U-turn] 退出 | 位置=({rx:.1f},{ry:.1f}) '
+                f'| 累计旋转={cum:.0f}° | 路径idx={self.ref_idx_hint}/{len(self.ref)}',
                 throttle_duration_sec=1.0)
+            self._uturn_logged = False
+        if in_uturn:
+            self._uturn_logged = True
         self._was_in_uturn = in_uturn
         self._log_in_uturn = in_uturn
         if in_uturn:
-            v, omega = self._pure_pursuit_track(rx, ry, ryaw)
-            # PP 模式：速度硬上限 0.2，完全跳过反应式避障层
-            v = 0.2
+            v, omega, delta = self._pure_pursuit_track(rx, ry, ryaw)
         elif self.mode == 'EDGE_FOLLOW':
-            v, omega = self._edge_follow_pd()
+            v, omega, delta = self._edge_follow_pd()
         else:
-            v, omega = self._stanley_track(rx, ry, ryaw, rv)
+            v, omega, delta = self._stanley_track(rx, ry, ryaw, rv)
 
         # ── 反应式避障层（PP 模式跳过，避免干扰 U-turn）──────────────
+        # 注意：此处直接修改 delta（前轮转向角），因为 Gazebo tricycle_drive 插件
+        #       将 cmd.angular.z 解释为 steering angle，而不是角速度 ω。
         if not in_uturn:
-            # 应用速度限制
+            self._log_delta = delta
+            self._log_delta_deg = math.degrees(delta)
             v = min(v, self.speed_limit)
 
             front_d, steer_dir = self._front_obstacle_info()
@@ -407,9 +455,11 @@ class ControllerNode(Node):
 
             emergency_stop = False
             avoid_label = 'none'
+            # 避障层的转向权重：avoid_gain 原为角速度增益（rad/s），
+            # 现按"等效 steering angle"使用。0.5 rad ≈ 28.6°，合理。
             if front_d < eff_stop:
                 v = 0.0
-                omega = steer_dir * self.avoid_gain
+                delta = steer_dir * self.avoid_gain
                 emergency_stop = True
                 avoid_label = 'STOP'
                 self.get_logger().warn(
@@ -419,45 +469,48 @@ class ControllerNode(Node):
                 t = (front_d - eff_stop) / max(0.01, eff_steer - eff_stop)
                 v *= t
                 v = max(v, self.v_min * 0.3)
-                avoid_w = steer_dir * self.avoid_gain * (1.0 - t)
-                omega = omega * t + avoid_w
+                avoid_d = steer_dir * self.avoid_gain * (1.0 - t)
+                delta = delta * t + avoid_d
                 avoid_label = 'steer'
             elif front_d < eff_slow:
                 t = (front_d - eff_steer) / max(0.01, eff_slow - eff_steer)
                 v *= (0.5 + 0.5 * t)
                 avoid_label = 'slow'
             self._log_avoid = avoid_label
-            self._log_omega_raw = omega
-            self._log_omega_clamped = abs(omega) > 0.05 and v > self.v_min
 
-            # 运动学约束（Ackermann 模型：omega = v × tan(δ) / L）
+            # 转向角物理限幅（URDF: ±0.8727 rad = ±50°）
+            delta = max(-self.delta_max, min(self.delta_max, delta))
+            self._log_delta = delta
+            self._log_delta_deg = math.degrees(delta)
+
+            # 角速度仅用于日志（实际不发给 Gazebo）
+            omega = v * math.tan(delta) / self.L if abs(v) > 1e-3 else 0.0
             omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
-            if emergency_stop:
-                omega = max(-self.w_max, min(self.w_max, omega))
-            else:
-                if abs(omega) > 0.05:
-                    v = max(v, self.v_min)
-                omega = max(-min(self.w_max, omega_kin_max),
-                            min(min(self.w_max, omega_kin_max), omega))
+            self._log_omega_kin_max = omega_kin_max
+            self._log_omega_raw = omega
+            self._log_omega_clamped = False
         else:
-            # PP 模式：只做运动学约束，不做反应式避障
-            omega_raw = omega
+            # U-turn 模式：直接使用 PP 算出的 delta，保证最低速度以产生足够牵引
+            v = max(v, 0.22)  # U-turn 最低速度 0.22 m/s（克服起步摩擦）
+            delta = max(-self.delta_max, min(self.delta_max, delta))
+            self._log_delta = delta
+            self._log_delta_deg = math.degrees(delta)
+            omega = v * math.tan(delta) / self.L if abs(v) > 1e-3 else 0.0
             omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
-            omega_clamped = max(-omega_kin_max, min(omega_kin_max, omega))
-            self._log_omega_raw = omega_raw
-            self._log_omega_clamped = (omega != omega_clamped)
-            omega = omega_clamped
-            self.get_logger().debug(
-                f'[PP] v指令=0.20 omega_raw={omega_raw:.3f} omega_clamped={omega:.3f} '
-                f'kin_max={omega_kin_max:.3f} 位置=({rx:.1f},{ry:.1f})',
-                throttle_duration_sec=1.0)
-            self._log_avoid = 'PP'
+            self._log_omega_kin_max = omega_kin_max
+            self._log_omega_raw = omega
+            self._log_omega_clamped = False
+            self._log_avoid = 'U-turn'
 
         self._log_v = v
         self._log_w = omega
         self._log_v_cmd = float(v)
+        # Gazebo tricycle_drive 插件将 cmd.angular.z 直接作为前轮转向角 δ (rad)
+        # 来源：gazebo_ros_tricycle_drive.cpp:227 — target_steering_angle = cmd_.angle
+        # 历史 bug：此前发送 omega=v·tan(δ)/L（角速度），插件误当作 steering angle，
+        #           导致实际转向角远小于期望，车辆 U-turn 时半径暴增撞墙
         cmd.linear.x  = float(v)
-        cmd.angular.z = float(omega)
+        cmd.angular.z = float(delta)
         self.pub_cmd.publish(cmd)
 
     # ── 路径弯道检测（U-turn 即将到来时抑制避障）───────────────────────
@@ -468,74 +521,312 @@ class ControllerNode(Node):
             return False
         # 防御性边界检查：确保索引在有效范围内
         idx = max(0, min(self.ref_idx_hint, n - 1))
-        # 0.25：只在 U-turn 弧段触发，直线段噪声不会触发
-        offsets = [3, 6, 10, 14]
-        for offset in offsets:
-            ci = min(n - 1, max(0, idx + offset))
+        # 基于路径前方曲率检测：kappa > 0.4 说明前方有急弯（U-turn）
+        for offset in [5, 10, 15, 20]:
+            ci = min(n - 1, idx + offset)
             kappa = abs(self._estimate_curvature(ci))
-            if kappa > 0.25:
+            if kappa > 0.4:
                 return True
         return False
 
     def _is_in_uturn(self) -> bool:
-        """检测当前是否处于 U-Turn 区间内（而不仅是即将到来）。"""
+        """U-turn 状态机：进入基于路径曲率 + 距弧心距离，退出基于**带符号累计航向旋转**。
+
+        关键：进入 U-turn 后采用 sticky 策略——退出条件仅基于"累计旋转"或"长时间卡住"，
+        不依赖 ref_idx 或 curvature 的即时判断。这样避免了每 tick 在 PP/Stanley 之间振荡
+        （原 bug 表现：cmd_δ 在 +50° 和 -50° 每 0.1s 交替，导致实际 R 从 0.88m 暴涨到 2.94m）。
+
+        进入条件（同时满足）：
+          ① 前方路径曲率 > 曲率阈值（意味着 U-turn 弧即将到来）
+          ② 车辆距离该急弯段最近点 ≤ 2.0 m（真的靠近弧入口）
+          ③ U-turn 可行性检查通过（弧心到车身前外角 < 距墙距离）
+
+        退出条件（任一满足）：
+          ① 带符号累计航向旋转绝对值 ≥ 175°（U-turn 已基本完成，这是主退出条件）
+          ② 长时间卡住（速度 < 0.02 m/s 持续 2.5s）
+          ③ 距南/北墙过近超过 0.5s（撞墙兜底）
+          ④ 入弧后超过 30s 仍未完成（安全超时）
+        """
         pts = self.ref
         n   = len(pts)
         if n < 5:
-            return False
-        # 防御性边界检查：确保索引在有效范围内
-        idx = max(0, min(self.ref_idx_hint, n - 1))
-        total_kappa = 0.0
-        count = 0
-        for delta in range(-3, 4):
-            ci = min(n - 1, max(0, idx + delta))
-            total_kappa += abs(self._estimate_curvature(ci))
-            count += 1
-        avg_kappa = total_kappa / count
-        return avg_kappa > 0.3
+            # 路径无效时仍按现状返回（不强制退出，避免在无路径tick 里切出）
+            return self._in_uturn
 
-    def _pure_pursuit_track(self, rx, ry, ryaw):
-        """Pure Pursuit：朝 look-ahead 点 steering，保证走规划路径。"""
+        if not self._heading_history or len(self._heading_history) < 3 or self.robot is None:
+            return self._in_uturn
+
+        rx, ry, ryaw, rv_local = self.robot
+        now_s = self._heading_history[-1][0]
+
+        if not self._in_uturn:
+            entered = self._check_uturn_entry(rx, ry, ryaw)
+            if entered:
+                self._uturn_entry_t = now_s
+                self._uturn_prev_yaw = ryaw
+                self._uturn_signed_cum = 0.0
+            return entered
+
+        # ── 在 U-turn 中 ─────────────────────────────────────────────
+        # 带符号增量累计：dyaw 用 wrap 规范化到 [-π, π]，然后累加
+        # 这样 180° / -180° 不会触发 abs() 的回折问题
+        dyaw = wrap(ryaw - self._uturn_prev_yaw)
+        self._uturn_signed_cum += dyaw
+        self._uturn_prev_yaw = ryaw
+        abs_cum = abs(self._uturn_signed_cum)
+        self._uturn_cum_rotation = abs_cum
+
+        # 条件1：累计航向旋转 ≥ 175°（主退出条件）
+        if abs_cum >= math.radians(175):
+            self.get_logger().info(
+                f'[U-turn] 完成退出 | 位置=({rx:.1f},{ry:.1f}) | '
+                f'累计旋转={math.degrees(abs_cum):.0f}° | 耗时={now_s - self._uturn_entry_t:.1f}s',
+                throttle_duration_sec=1.0)
+            self._in_uturn = False
+            self._uturn_logged = False
+            return False
+
+        # 条件2：长时间卡住（速度 < 0.02 m/s 持续 2.5s）
+        if rv_local < 0.02:
+            if self._uturn_stuck_t == 0.0:
+                self._uturn_stuck_t = now_s
+            elif now_s - self._uturn_stuck_t >= 2.5:
+                self.get_logger().warn(
+                    f'[U-turn] 卡住退出（可能撞墙）| 位置=({rx:.1f},{ry:.1f}) | '
+                    f'累计旋转={math.degrees(abs_cum):.0f}° | 速度={rv_local:.2f}',
+                    throttle_duration_sec=1.0)
+                self._in_uturn = False
+                self._uturn_logged = False
+                self._uturn_stuck_t = 0.0
+                return False
+        else:
+            self._uturn_stuck_t = 0.0
+
+        # 条件3：距离南北墙过近（安全兜底）
+        if ry > self.area_y_max - 0.4 or ry < self.area_y_min + 0.4:
+            if self._uturn_north_t == 0.0:
+                self._uturn_north_t = now_s
+            elif now_s - self._uturn_north_t >= 0.5:
+                self.get_logger().warn(
+                    f'[U-turn] 南/北墙警报退出 | 位置=({rx:.1f},{ry:.1f}) | '
+                    f'累计旋转={math.degrees(abs_cum):.0f}°',
+                    throttle_duration_sec=1.0)
+                self._in_uturn = False
+                self._uturn_logged = False
+                self._uturn_north_t = 0.0
+                return False
+        else:
+            self._uturn_north_t = 0.0
+
+        # 条件4：U-turn 超时（sim 中正常 U-turn ≤ 12s，设 30s 为兜底）
+        if now_s - self._uturn_entry_t >= 30.0:
+            self.get_logger().warn(
+                f'[U-turn] 超时 30s 退出 | 位置=({rx:.1f},{ry:.1f}) | '
+                f'累计旋转={math.degrees(abs_cum):.0f}°',
+                throttle_duration_sec=1.0)
+            self._in_uturn = False
+            self._uturn_logged = False
+            return False
+
+        # Sticky：在 U-turn 内，其他任何条件都不触发退出
+        return True
+
+    def _check_uturn_entry(self, rx, ry, ryaw) -> bool:
+        """判断是否应该进入 U-turn 模式。
+        必要条件：
+          ① 前方路径在较近距离内有急弯（kappa > 0.4）
+          ② 车辆距离该弯段入口足够近（沿路径距离 < 2.0m）
+          ③ 弯段末端位置在车辆前方（不会从后方触发）
+
+        注：还会调用 _verify_uturn_feasibility 做几何可行性检查。
+        """
         pts = self.ref
         n   = len(pts)
-        # 防御性边界检查：确保 ref_idx_hint 在有效范围内
-        if self.ref_idx_hint >= n:
-            self.ref_idx_hint = n - 1
-        if self.ref_idx_hint < 0:
-            self.ref_idx_hint = 0
+        idx = max(0, min(self.ref_idx_hint, n - 1))
 
-        idx = self.ref_idx_hint
-        L_DA = 0.6  # look-ahead 距离（U-turn 时用短距离，更精准）
+        # 查找前方第一个急弯点
+        sharp_idx = None
+        for offset in range(2, min(40, n - idx)):
+            ci = idx + offset
+            if abs(self._estimate_curvature(ci)) > 0.4:
+                sharp_idx = ci
+                break
+        if sharp_idx is None:
+            return False
 
-        best_d  = float('inf')
-        best_i  = idx
-        search_lo = max(0, idx - 5)
-        search_hi = min(n - 1, idx + 50)
-        for i in range(search_lo, search_hi + 1):
+        # 弯段入口距离（沿路径累积距离）
+        arc_entry_dist = 0.0
+        for i in range(idx, sharp_idx):
+            if i + 1 < n:
+                arc_entry_dist += math.hypot(
+                    pts[i+1][0] - pts[i][0],
+                    pts[i+1][1] - pts[i][1])
+        if arc_entry_dist > 2.0:
+            return False  # 还太远，先用 Stanley
+
+        # 几何可行性检查（确认 U-turn 弧半径够大，不会撞墙）
+        if not self._verify_uturn_feasibility(sharp_idx):
+            self.get_logger().warn(
+                f'[U-turn] 可行性检查失败 — 继续用 Stanley 跟踪',
+                throttle_duration_sec=2.0)
+            return False
+
+        # 进入 U-turn 模式
+        self._in_uturn = True
+        self._uturn_yaw_start = ryaw
+        self._uturn_cum_rotation = 0.0
+        self._uturn_logged = False
+        self._uturn_stuck_t = 0.0
+        self._uturn_north_t = 0.0
+        self._uturn_reversed = False
+        self.get_logger().info(
+            f'[U-turn] 进入 | 位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}° '
+            f'| 弯段idx={sharp_idx}/{n} 距离={arc_entry_dist:.2f}m',
+            throttle_duration_sec=1.0)
+        return True
+
+    def _verify_uturn_feasibility(self, sharp_idx: int) -> bool:
+        """检查 U-turn 路径是否物理可行：
+          1. 估算弧段半径（由连续曲率的平均值推算）
+          2. 弧心到车身前外角最大距离 + 安全余量 ≤ 距墙距离
+          3. 估算的弧半径 ≥ 车辆物理最小转弯半径
+        """
+        pts = self.ref
+        n   = len(pts)
+        if sharp_idx >= n - 3 or sharp_idx < 3:
+            return True  # 路径末端，不做严格检查
+
+        # 估算弧半径：取连续 5 个点曲率平均值的倒数
+        total_k = 0.0
+        cnt = 0
+        for i in range(max(0, sharp_idx - 2), min(n, sharp_idx + 3)):
+            k = abs(self._estimate_curvature(i))
+            if k > 0.1:
+                total_k += k
+                cnt += 1
+        if cnt == 0:
+            return True
+        avg_k = total_k / cnt
+        est_R = 1.0 / max(avg_k, 0.01)
+
+        # 车辆物理最小转弯半径 = L / tan(delta_max)
+        veh_min_r = self.L / math.tan(self.delta_max)
+
+        # 条件1：估算弧半径 ≥ 车辆物理最小值 × 95%（留少量余量）
+        if est_R < veh_min_r * 0.95:
+            self.get_logger().warn(
+                f'[U-turn] 估算半径 {est_R:.2f}m < 物理最小 {veh_min_r:.2f}m',
+                throttle_duration_sec=2.0)
+            return False
+
+        # 条件2：弧段最远点（通常是横向极值）到墙距离足够
+        # 取弧段点集中 x 或 y 绝对值最大的点
+        sub = pts[max(0, sharp_idx - 5): min(n, sharp_idx + 20)]
+        body_long = 1.41   # URDF: 后轴到前外角纵向
+        body_hw = 0.525    # URDF: 车身半宽
+        # 车辆在弧上跟踪时，车身前外角最大伸出距离
+        # = sqrt((est_R + body_hw)² + body_long²) - est_R
+        # 这是"外扩量"：弧心距车身前外角 - 弧半径
+        body_out = math.sqrt((est_R + body_hw)**2 + body_long**2) - est_R
+        for px, py, _ in sub:
+            # 距四面墙的最小距离
+            min_wall = min(
+                self.area_x_max - px,
+                px - self.area_x_min,
+                self.area_y_max - py,
+                py - self.area_y_min,
+            )
+            if min_wall < body_out - 0.05:
+                self.get_logger().warn(
+                    f'[U-turn] 弧段点({px:.1f},{py:.1f})距墙{min_wall:.2f}m < '
+                    f'需要{body_out:.2f}m',
+                    throttle_duration_sec=2.0)
+                return False
+
+        return True
+
+    def _pure_pursuit_track(self, rx, ry, ryaw):
+        """U-turn 模式：基于 reference_path 的 Pure Pursuit 跟踪。
+
+        算法：
+          1. 在参考路径上前瞻 Ld 距离找到目标点 (tx, ty)
+          2. 计算车辆坐标系下目标点的横向偏移 ey
+          3. Pure Pursuit 曲率公式：kappa = 2·ey / Ld²
+          4. 转向角 delta = atan(L · kappa)
+          5. 速度取较慢值，允许稳定过弯
+
+        Ld 根据路径曲率自适应：
+          直线段: Ld = 2.0m, 弯道: Ld = 1.2m（更紧跟踪）
+        """
+        pts = self.ref
+        n   = len(pts)
+
+        if n < 2 or self.robot is None:
+            return 0.0, 0.0, 0.0
+
+        # ── 1. 自适应前瞻距离 ─────────────────────────────────────────
+        idx = max(0, min(self.ref_idx_hint, n - 1))
+        # 当前曲率 → 前瞻距离
+        cur_k = abs(self._estimate_curvature(idx))
+        # 弯道越急，前瞻越短（0.7~2.0m）
+        Ld = max(0.7, min(2.0, 2.0 - 2.5 * cur_k))
+
+        # ── 2. 在路径上前瞻 Ld 距离找目标点 ──────────────────────────
+        # 先把路径索引移到距离机器人最近的点（防止落后）
+        best_d = float('inf')
+        best_i = idx
+        lo = max(0, idx - 3)
+        hi = min(n - 1, idx + 25)
+        for i in range(lo, hi + 1):
             d = math.hypot(rx - pts[i][0], ry - pts[i][1])
             if d < best_d:
                 best_d = d
                 best_i = i
+        # 只单调向前推进
+        if best_i > self.ref_idx_hint:
+            self.ref_idx_hint = best_i
 
-        la_i = best_i
-        for i in range(best_i, min(n - 1, best_i + 50)):
-            d = math.hypot(rx - pts[i][0], ry - pts[i][1])
-            if d >= L_DA:
-                la_i = i
+        # 从 best_i 沿路径累积距离，找到第一个 >= Ld 的点
+        acc = 0.0
+        target_i = best_i
+        for i in range(best_i, n - 1):
+            d = math.hypot(pts[i+1][0] - pts[i][0],
+                           pts[i+1][1] - pts[i][1])
+            acc += d
+            target_i = i + 1
+            if acc >= Ld:
                 break
+        tx, ty, _ = pts[target_i]
 
-        # 再次边界检查 la_i
-        la_i = min(la_i, n - 1)
-        lx, ly, _ = pts[la_i]
-        dx = lx - rx
-        dy = ly - ry
-        alpha = wrap(math.atan2(dy, dx) - ryaw)
-        delta = math.atan2(2.0 * self.L * math.sin(alpha), L_DA)
+        # ── 3. 车辆坐标系下目标点的横向偏移 ey ──────────────────────
+        dx = tx - rx
+        dy = ty - ry
+        # 目标点到车的距离（实际前瞻）
+        L_actual = max(0.3, math.hypot(dx, dy))
+        # 车辆坐标系：x 沿航向前方，y 向左
+        lx = math.cos(-ryaw) * dx - math.sin(-ryaw) * dy
+        ly = math.sin(-ryaw) * dx + math.cos(-ryaw) * dy
+
+        # 如果目标在车后方（lx < 0），朝向误差过大，用最大转向推动到前方
+        if lx < 0.1:
+            # 目标在侧后，尽量转向目标侧
+            delta = self.delta_max if ly > 0 else -self.delta_max
+        else:
+            # ── 4. Pure Pursuit 曲率 ──────────────────────────────
+            # kappa = 2·ey / L²
+            kappa = 2.0 * ly / (L_actual * L_actual)
+            # 转向角 δ = atan(L_wb · kappa)
+            delta = math.atan(self.L * kappa)
+
+        # 限幅到物理最大转向角
         delta = max(-self.delta_max, min(self.delta_max, delta))
 
-        v = 0.2  # U-turn 目标速度：0.2 m/s
+        # ── 5. 速度 ─────────────────────────────────────────────────
+        # U-turn 中用较低速度以维持稳定，但不能太低（避免 Gazebo 摩擦导致停滞）
+        v = 0.25  # 掉头速度（平衡速度与控制精度）
+
         omega = v * math.tan(delta) / self.L
-        return v, omega
+        return v, omega, delta
 
     # ── 5 秒状态日志 ─────────────────────────────────────────────────
     def _log_status(self):
@@ -543,16 +834,19 @@ class ControllerNode(Node):
             return
         rx, ry, ryaw, rv = self.robot
         turn = self._has_upcoming_turn()
-        uturn_mode = 'PP(U-turn)' if self._log_in_uturn else self.mode
+        uturn_mode = 'U-turn' if self._log_in_uturn else self.mode
         omega_note = (' (钳制!)' if self._log_omega_clamped else '')
+        delta_note = (' (限幅!)' if abs(self._log_delta) >= self.delta_max * 0.98 else '')
         self.get_logger().info(
             f'[控制] 模式={uturn_mode} | '
-            f'指令速度={self._log_v_cmd:.2f} 指令角速度={self._log_w:.2f}{omega_note}'
-            f' | 实际速度={rv:.2f} | '
-            f'omega原始={self._log_omega_raw:.2f} | '
-            f'前方距离={self._log_front_d:.2f}m 避障={self._log_avoid} '
-            f'弯道预判={"是" if turn else "否"} | '
-            f'参考路径={len(self.ref)}pt idx={self.ref_idx_hint} | '
+            f'v指令={self._log_v_cmd:.2f} omega={self._log_w:.2f}{omega_note}'
+            f' delta={self._log_delta_deg:.1f}°{delta_note}'
+            f' kin_max={self._log_omega_kin_max:.3f}'
+            f' | 实际v={rv:.2f} | '
+            f'omega_raw={self._log_omega_raw:.2f} | '
+            f'前方={self._log_front_d:.2f}m 避障={self._log_avoid} '
+            f'弯道={"是" if turn else "否"} | '
+            f'路径={len(self.ref)}pt idx={self.ref_idx_hint} | '
             f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}°')
 
     # ── 前方障碍物扫描 ─────────────────────────────────────────────────
@@ -677,7 +971,7 @@ class ControllerNode(Node):
         # ── 最终速度上限限制（确保不超过行为层限速）────────────────────
         v_sched = min(v_sched, self.speed_limit)
 
-        return v_sched, omega
+        return v_sched, omega, delta
 
     def _estimate_curvature(self, idx: int) -> float:
         pts = self.ref
@@ -732,7 +1026,7 @@ class ControllerNode(Node):
                         - 0.5 * heading_err)   # heading修正方向与距离修正相反
 
         v = max(self.v_min, self.speed_limit * 0.65)
-        return v, omega
+        return v, omega, 0.0
 
     def _estimate_wall_heading_err(self, side: str) -> float:
         """
