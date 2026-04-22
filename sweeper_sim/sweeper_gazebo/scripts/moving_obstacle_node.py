@@ -3,6 +3,10 @@
 Moving pedestrian obstacle controller.
 
 Drives the 'pedestrian' model on a looping path through the sweep area.
+
+Fix: use async timer instead of blocking wait_for_service(), so the node
+starts spinning immediately and calls the service asynchronously once it is
+available (avoids deadlock when the service takes time to register).
 """
 import math
 import rclpy
@@ -27,16 +31,24 @@ class MovingObstacleNode(Node):
     def __init__(self):
         super().__init__('moving_obstacle_node')
         self.cli = self.create_client(SetEntityState, '/gazebo/set_entity_state')
-        while not self.cli.wait_for_service(timeout_sec=3.0):
-            self.get_logger().info('Waiting for /gazebo/set_entity_state...')
+        self._service_ready = False
 
         self.wp_idx = 0
         self.x = float(WAYPOINTS[0][0])
         self.y = float(WAYPOINTS[0][1])
+
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('moving_obstacle_node ready')
+        self.get_logger().info('moving_obstacle_node ready (async mode)')
 
     def tick(self):
+        # Check if service is available (non-blocking)
+        if not self._service_ready:
+            if self.cli.service_is_ready():
+                self._service_ready = True
+                self.get_logger().info('/gazebo/set_entity_state available, starting movement')
+            else:
+                return  # keep polling every 0.1s
+
         tx, ty = WAYPOINTS[self.wp_idx]
         dx = tx - self.x
         dy = ty - self.y

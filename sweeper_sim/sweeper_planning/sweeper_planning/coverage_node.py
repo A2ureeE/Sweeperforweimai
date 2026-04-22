@@ -216,10 +216,6 @@ class CoverageNode(Node):
         # 车身半宽 1.05/2=0.525m; 保险余量 0.10m → turn_r + 0.625
         x_margin = max(self.edge_off, self.turn_r + 0.65)
 
-        self.get_logger().info(
-            f'Coverage build: y_edge={eff_edge:.2f}m, x_margin={x_margin:.2f}m, '
-            f'spacing={eff_spacing:.2f}m, arc_R={arc_R:.2f}m')
-
         # ── 内侧扫行（boustrophedon + 闭合 U 形弯）──────────────────
         # 不再生成边界条——边界条的直角拐角会令机器人撞东/西墙卡死；
         # 内层扫行的 sweep_hw 已延伸至距墙 ~0.35m，覆盖率足够。
@@ -229,6 +225,10 @@ class CoverageNode(Node):
         ix_max = self.xmax - x_margin
         iy_min = self.ymin + eff_edge
         iy_max = self.ymax - eff_edge
+
+        self.get_logger().info(
+            f'Coverage build: y_edge={eff_edge:.2f}m, x_margin={x_margin:.2f}m, '
+            f'spacing={eff_spacing:.2f}m, arc_R={arc_R:.2f}m')
 
         ys = np.arange(iy_min, iy_max + eff_spacing * 0.01, eff_spacing)
 

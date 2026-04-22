@@ -213,9 +213,15 @@ class PlannerNode(Node):
         self._prev_mode = self.mode
 
         # ── 前向滑动窗口推进 ────────────────────────────────────────────
-        if self.progress_idx == 0:
-            # 从路径起点出发，不做全局最近点搜索
-            self.progress_idx = 0
+        old_idx = self.progress_idx
+        if self.progress_idx == 0 and not self._returning_from_detour:
+            # 机器人从起点出发时，只在窗口内搜索最近点，避免永远卡在 0
+            window_end = min(n - 1, self.progress_idx + 10)
+            sub = pts[self.progress_idx: window_end + 1]
+            d2 = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
+            nearest_in_window = int(np.argmin(d2))
+            self.progress_idx = max(self.progress_idx, self.progress_idx + nearest_in_window)
+            self.get_logger().debug(f'[DEBUG] 分支1: idx 0→{self.progress_idx}, pos=({rx:.1f},{ry:.1f})')
         elif self._returning_from_detour:
             window_end = min(n - 1, self.progress_idx + 50)
             sub  = pts[self.progress_idx: window_end + 1]

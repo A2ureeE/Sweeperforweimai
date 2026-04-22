@@ -147,15 +147,11 @@ def generate_launch_description():
         parameters=[cfg_planning, {'use_sim_time': True}],
         output='screen')
 
-    controller_node = TimerAction(
-        period=30.0,
-        actions=[
-            Node(
-                package='sweeper_control', executable='controller_node',
-                name='controller_node',
-                parameters=[cfg_control, map_params],
-                output='screen')
-        ])
+    controller_node = Node(
+        package='sweeper_control', executable='controller_node',
+        name='controller_node',
+        parameters=[cfg_control, map_params],
+        output='screen')
 
     # ── 3. Score / mission nodes ──────────────────────────────────────
     score_logger_node = Node(
@@ -187,8 +183,11 @@ def generate_launch_description():
             behavior_node,
             coverage_node,
             planner_node,
-            controller_node,
         ])
+
+    delayed_controller = TimerAction(
+        period=10.0,
+        actions=[controller_node])
 
     delayed_loggers = TimerAction(
         period=6.0,
@@ -204,5 +203,6 @@ def generate_launch_description():
         gazebo_launch,
         rviz_node,
         delayed_nodes,
+        delayed_controller,
         delayed_loggers,
     ])

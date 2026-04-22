@@ -55,6 +55,11 @@ def generate_launch_description():
         value=os.path.join(pkg_gz, 'models') + ':' +
               os.environ.get('GAZEBO_MODEL_PATH', ''))
 
+    set_gz_resource_path = SetEnvironmentVariable(
+        name='GAZEBO_RESOURCE_PATH',
+        value='/usr/share/gazebo-11/media:' +
+              os.environ.get('GAZEBO_RESOURCE_PATH', ''))
+
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [PathJoinSubstitution([FindPackageShare('gazebo_ros'),
@@ -90,6 +95,7 @@ def generate_launch_description():
     return LaunchDescription([
         world_arg, x_arg, y_arg, yaw_arg, gui_arg,
         set_gz_model_path,
+        set_gz_resource_path,
         gazebo,
         description,
         spawn,

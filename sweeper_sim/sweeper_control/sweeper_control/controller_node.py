@@ -31,6 +31,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import Path, Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+from rosgraph_msgs.msg import Clock
 from std_msgs.msg import String, Float32
 import tf_transformations as tft
 
@@ -121,6 +122,13 @@ class ControllerNode(Node):
         self.sub_speed = self.create_subscription(Float32,   '/behavior/speed_limit', self.cb_speed, 5)
         self.sub_scan  = self.create_subscription(LaserScan, '/scan',                 self.cb_scan,  sensor_qos)
 
+        # 订阅 Gazebo /clock：用 Gazebo sim time 驱动 30s 启动延迟
+        # Gazebo /clock 使用 BEST_EFFORT QoS
+        clock_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.sub_clock = self.create_subscription(Clock, '/clock', self.cb_clock, clock_qos)
+        self._sim_elapsed_s = 0.0   # Gazebo sim time 秒数
+        self._delay_done    = False  # 延迟是否已完成
+
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 5)
 
         # 恢复指令订阅（来自 behavior_node，避障结束后回归原路径）
@@ -151,8 +159,13 @@ class ControllerNode(Node):
         # 状态日志（每 5s 输出一次）
         self._log_v = 0.0
         self._log_w = 0.0
+        self._log_in_uturn = False       # 当前是否为 PP 模式
+        self._log_omega_raw = 0.0         # omega 钳制前的原始值
+        self._log_omega_clamped = False   # omega 是否被 kin 约束钳制
+        self._log_v_cmd = 0.0            # 最终发布的速度指令
+        self._was_in_uturn = False       # 上一帧是否为 PP 模式（用于检测进入/退出）
         self._trajectory_received = False  # 等待 RViz 绿色轨迹
-        self._path_entry_fixed    = False  # 首次接收路径时强制从索引0出发
+        self._entry_locked       = False  # 入口点已锁定，延迟结束后不再更新
         self._log_front_d = 999.0
         self._log_avoid = 'none'
         self._saved_ref_idx = 0     # 避障时保存的路径索引，恢复时使用
@@ -162,32 +175,21 @@ class ControllerNode(Node):
         self.get_logger().info('controller_node ready')
 
     # ── 回调 ────────────────────────────────────────────────────────────
+    def cb_clock(self, msg: Clock):
+        self._sim_elapsed_s = float(msg.clock.sec) + float(msg.clock.nanosec) * 1e-9
+
     def cb_ref(self, msg: Path):
         self.ref = [(p.pose.position.x, p.pose.position.y,
                      yaw_from_quat(p.pose.orientation))
                     for p in msg.poses]
-        self._trajectory_received = True  # RViz 绿色轨迹已到达，可以发车
+        self._trajectory_received = True  # RViz 绿色轨迹已到达
 
-        if self.robot is not None and self.ref:
-            # 仅在避障恢复时使用最近点搜索；首次启动时强制从轨迹起点(索引0)出发，
-            # 避免最近的点跳到轨迹中间导致里程浪费。
-            rx, ry, _, _ = self.robot
-            if self._path_entry_fixed:
-                # 已在轨迹上，进行避障恢复式最近点搜索
-                best_d = float('inf')
-                best_i = 0
-                for i, (px, py, _) in enumerate(self.ref):
-                    d = math.hypot(rx - px, ry - py)
-                    if d < best_d:
-                        best_d = d
-                        best_i = i
-                self.ref_idx_hint = best_i
-            else:
-                # 首次接收路径：强制从轨迹起点出发，不做最近点搜索
-                self.ref_idx_hint = 0
-                self._path_entry_fixed = True
-        else:
-            self.ref_idx_hint = 0
+        # 路径到达时，如果 robot 位置已知，同步确定入口点
+        # （robot 未到时，cb_odom 会处理）
+        # 如果入口已锁定，不更新（保持延迟结束时的入点）
+        if not self._entry_locked and self.robot is not None and self.ref:
+            self._fix_entry_point()
+            self._entry_locked = True
 
     def cb_odom(self, msg: Odometry):
         x   = msg.pose.pose.position.x
@@ -196,10 +198,53 @@ class ControllerNode(Node):
         v   = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
         self.robot = (x, y, yaw, v)
 
-        # 路径早到、odom 晚到：确保路径入口固定到起点
-        if self.ref and not self._path_entry_fixed:
+        # robot 数据到达时，如果路径已就位，同步确定入口点
+        # 如果入口已锁定，不更新（保持延迟结束时的入点）
+        if not self._entry_locked and self.ref and self.ref:
+            self._fix_entry_point()
+            self._entry_locked = True
+
+    def _fix_entry_point(self):
+        """统一在 robot 位置已知 + 路径已就绪 时确定入口点。
+        首次启动时强制从轨迹起点（索引0）出发，避免跳到路径中间。
+        后续（避障恢复）才允许最近点搜索。
+        """
+        if not self.ref or self.robot is None:
+            return
+        rx, ry, _, _ = self.robot
+        if self._trajectory_received:
+            # 轨迹已到（RViz 绿色），从起点出发
             self.ref_idx_hint = 0
-            self._path_entry_fixed = True
+        else:
+            # 轨迹未到但路径已收到：用最近点搜索（容错处理）
+            best_d = float('inf')
+            best_i = 0
+            for i, (px, py, _) in enumerate(self.ref):
+                d = math.hypot(rx - px, ry - py)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            self.ref_idx_hint = best_i
+
+    def _find_nearest_entry(self):
+        """延迟结束时用最近点搜索定位入点，从当前位置自然切入路径。
+        不强制 index 0，因为延迟期间的 odom 漂移可能导致
+        强制 index 0 后机器人要逆向追赶路径起点，反而造成入点跳变。"""
+        if not self.ref or self.robot is None:
+            self.ref_idx_hint = 0
+            self._entry_locked = True
+            return
+        rx, ry, _, _ = self.robot
+        best_d = float('inf')
+        best_i = 0
+        for i, (px, py, _) in enumerate(self.ref):
+            d = math.hypot(rx - px, ry - py)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        self.ref_idx_hint = best_i
+        self._entry_locked = True
+        self.get_logger().info(f'延迟结束，入口点={best_i}，最近距离={best_d:.2f}m')
 
     def cb_mode(self, msg: String):
         raw = msg.data
@@ -233,12 +278,25 @@ class ControllerNode(Node):
     # ── 主控制循环 ───────────────────────────────────────────────────────
     def tick(self):
         cmd = Twist()
+
+        # ── 10s 启动延迟（基于 Gazebo /clock 的真实 sim time）────────
+        if not self._delay_done:
+            if self._sim_elapsed_s >= 10.0:
+                self._delay_done = True
+                # 延迟结束时：用最近点搜索定位入口，确保从当前位置跟踪路径
+                self._find_nearest_entry()
+                self.get_logger().info('10s sim 延迟结束，车辆开始行驶')
+            else:
+                # 延迟期间主动制动：发 -0.6 m/s 反向速度，对抗 Gazebo 推力
+                cmd.linear.x = -0.6
+                self.pub_cmd.publish(cmd)
+                return
         if self.robot is None:
             self.pub_cmd.publish(cmd)
             return
 
         rx, ry, ryaw, rv = self.robot
-        now_ns = self.get_clock().now().nanoseconds()
+        now_ns = self.get_clock().now().nanoseconds
 
         # ── Stuck 检测（净位移版）──────────────────────────────────────
         now_s = now_ns / 1e9
@@ -314,62 +372,90 @@ class ControllerNode(Node):
 
         # ── 控制策略选择 ────────────────────────────────────────────────
         # U-Turn 区间内用 Pure Pursuit，其他情况用 Stanley
-        if self._is_in_uturn():
+        in_uturn = self._is_in_uturn()
+        if in_uturn and not self._was_in_uturn:
+            self.get_logger().info(
+                f'[PP] 进入 U-turn | 位置=({rx:.1f},{ry:.1f}) '
+                f'| 路径索引={self.ref_idx_hint}/{len(self.ref)}',
+                throttle_duration_sec=1.0)
+        if not in_uturn and self._was_in_uturn:
+            self.get_logger().info(
+                f'[PP] 退出 U-turn | 位置=({rx:.1f},{ry:.1f})',
+                throttle_duration_sec=1.0)
+        self._was_in_uturn = in_uturn
+        self._log_in_uturn = in_uturn
+        if in_uturn:
             v, omega = self._pure_pursuit_track(rx, ry, ryaw)
+            # PP 模式：速度硬上限 0.2，完全跳过反应式避障层
+            v = 0.2
         elif self.mode == 'EDGE_FOLLOW':
             v, omega = self._edge_follow_pd()
         else:
             v, omega = self._stanley_track(rx, ry, ryaw, rv)
 
-        # 应用速度限制
-        v = min(v, self.speed_limit)
+        # ── 反应式避障层（PP 模式跳过，避免干扰 U-turn）──────────────
+        if not in_uturn:
+            # 应用速度限制
+            v = min(v, self.speed_limit)
 
-        # 前方障碍物反应式避障（路径弯道时抑制，避免干扰 U-turn）
-        front_d, steer_dir = self._front_obstacle_info()
-        self._log_front_d = front_d
-        turning = self._has_upcoming_turn()
-        eff_stop  = self.obs_stop_d  * (0.4 if turning else 1.0)
-        eff_steer = self.obs_steer_d * (0.4 if turning else 1.0)
-        eff_slow  = self.obs_slow_d  * (0.5 if turning else 1.0)
+            front_d, steer_dir = self._front_obstacle_info()
+            self._log_front_d = front_d
+            turning = self._has_upcoming_turn()
+            eff_stop  = self.obs_stop_d  * (0.4 if turning else 1.0)
+            eff_steer = self.obs_steer_d * (0.4 if turning else 1.0)
+            eff_slow  = self.obs_slow_d  * (0.5 if turning else 1.0)
 
-        emergency_stop = False
-        avoid_label = 'none'
-        if front_d < eff_stop:
-            v = 0.0
-            omega = steer_dir * self.avoid_gain
-            emergency_stop = True
-            avoid_label = 'STOP'
-            self.get_logger().warn(
-                f'前方障碍 {front_d:.2f}m — 紧急转向',
-                throttle_duration_sec=1.0)
-        elif front_d < eff_steer:
-            t = (front_d - eff_stop) / max(0.01, eff_steer - eff_stop)
-            v *= t
-            v = max(v, self.v_min * 0.3)
-            avoid_w = steer_dir * self.avoid_gain * (1.0 - t)
-            omega = omega * t + avoid_w
-            avoid_label = 'steer'
-        elif front_d < eff_slow:
-            t = (front_d - eff_steer) / max(0.01, eff_slow - eff_steer)
-            v *= (0.5 + 0.5 * t)
-            avoid_label = 'slow'
-        self._log_avoid = avoid_label
+            emergency_stop = False
+            avoid_label = 'none'
+            if front_d < eff_stop:
+                v = 0.0
+                omega = steer_dir * self.avoid_gain
+                emergency_stop = True
+                avoid_label = 'STOP'
+                self.get_logger().warn(
+                    f'前方障碍 {front_d:.2f}m — 紧急转向',
+                    throttle_duration_sec=1.0)
+            elif front_d < eff_steer:
+                t = (front_d - eff_stop) / max(0.01, eff_steer - eff_stop)
+                v *= t
+                v = max(v, self.v_min * 0.3)
+                avoid_w = steer_dir * self.avoid_gain * (1.0 - t)
+                omega = omega * t + avoid_w
+                avoid_label = 'steer'
+            elif front_d < eff_slow:
+                t = (front_d - eff_steer) / max(0.01, eff_slow - eff_steer)
+                v *= (0.5 + 0.5 * t)
+                avoid_label = 'slow'
+            self._log_avoid = avoid_label
+            self._log_omega_raw = omega
+            self._log_omega_clamped = abs(omega) > 0.05 and v > self.v_min
 
-        # 运动学约束（Ackermann 模型：omega = v × tan(δ) / L）
-        omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
-        if emergency_stop:
-            omega = max(-self.w_max, min(self.w_max, omega))
+            # 运动学约束（Ackermann 模型：omega = v × tan(δ) / L）
+            omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
+            if emergency_stop:
+                omega = max(-self.w_max, min(self.w_max, omega))
+            else:
+                if abs(omega) > 0.05:
+                    v = max(v, self.v_min)
+                omega = max(-min(self.w_max, omega_kin_max),
+                            min(min(self.w_max, omega_kin_max), omega))
         else:
-            if abs(omega) > 0.05:
-                v = max(v, self.v_min)
-            omega = max(-min(self.w_max, omega_kin_max),
-                        min(min(self.w_max, omega_kin_max), omega))
+            # PP 模式：只做运动学约束，不做反应式避障
+            omega_raw = omega
+            omega_kin_max = max(0.01, v) * math.tan(self.delta_max) / self.L
+            omega_clamped = max(-omega_kin_max, min(omega_kin_max, omega))
+            self._log_omega_raw = omega_raw
+            self._log_omega_clamped = (omega != omega_clamped)
+            omega = omega_clamped
+            self.get_logger().debug(
+                f'[PP] v指令=0.20 omega_raw={omega_raw:.3f} omega_clamped={omega:.3f} '
+                f'kin_max={omega_kin_max:.3f} 位置=({rx:.1f},{ry:.1f})',
+                throttle_duration_sec=1.0)
+            self._log_avoid = 'PP'
 
         self._log_v = v
         self._log_w = omega
-        # PP 模式下强制 0.2 硬上限（U-turn 时允许蹭过去）
-        if self._is_in_uturn():
-            v = 0.2
+        self._log_v_cmd = float(v)
         cmd.linear.x  = float(v)
         cmd.angular.z = float(omega)
         self.pub_cmd.publish(cmd)
@@ -377,27 +463,32 @@ class ControllerNode(Node):
     # ── 路径弯道检测（U-turn 即将到来时抑制避障）───────────────────────
     def _has_upcoming_turn(self) -> bool:
         pts = self.ref
-        if len(pts) < 5:
+        n   = len(pts)
+        if n < 5:
             return False
-        idx = self.ref_idx_hint
-        offsets = [3, 6, 10, 14]  # 直线段: 1.5m~7m 预警; 弧段: 0.5m~2.3m 触发 PP
+        # 防御性边界检查：确保索引在有效范围内
+        idx = max(0, min(self.ref_idx_hint, n - 1))
+        # 0.25：只在 U-turn 弧段触发，直线段噪声不会触发
+        offsets = [3, 6, 10, 14]
         for offset in offsets:
-            ci = min(len(pts) - 1, idx + offset)
+            ci = min(n - 1, max(0, idx + offset))
             kappa = abs(self._estimate_curvature(ci))
-            if kappa > 0.10:
+            if kappa > 0.25:
                 return True
         return False
 
     def _is_in_uturn(self) -> bool:
         """检测当前是否处于 U-Turn 区间内（而不仅是即将到来）。"""
         pts = self.ref
-        if len(pts) < 5:
+        n   = len(pts)
+        if n < 5:
             return False
-        idx = self.ref_idx_hint
+        # 防御性边界检查：确保索引在有效范围内
+        idx = max(0, min(self.ref_idx_hint, n - 1))
         total_kappa = 0.0
         count = 0
         for delta in range(-3, 4):
-            ci = min(len(pts) - 1, max(0, idx + delta))
+            ci = min(n - 1, max(0, idx + delta))
             total_kappa += abs(self._estimate_curvature(ci))
             count += 1
         avg_kappa = total_kappa / count
@@ -407,8 +498,13 @@ class ControllerNode(Node):
         """Pure Pursuit：朝 look-ahead 点 steering，保证走规划路径。"""
         pts = self.ref
         n   = len(pts)
-        idx = self.ref_idx_hint
+        # 防御性边界检查：确保 ref_idx_hint 在有效范围内
+        if self.ref_idx_hint >= n:
+            self.ref_idx_hint = n - 1
+        if self.ref_idx_hint < 0:
+            self.ref_idx_hint = 0
 
+        idx = self.ref_idx_hint
         L_DA = 0.6  # look-ahead 距离（U-turn 时用短距离，更精准）
 
         best_d  = float('inf')
@@ -428,6 +524,8 @@ class ControllerNode(Node):
                 la_i = i
                 break
 
+        # 再次边界检查 la_i
+        la_i = min(la_i, n - 1)
         lx, ly, _ = pts[la_i]
         dx = lx - rx
         dy = ly - ry
@@ -445,13 +543,16 @@ class ControllerNode(Node):
             return
         rx, ry, ryaw, rv = self.robot
         turn = self._has_upcoming_turn()
+        uturn_mode = 'PP(U-turn)' if self._log_in_uturn else self.mode
+        omega_note = (' (钳制!)' if self._log_omega_clamped else '')
         self.get_logger().info(
-            f'[控制] 模式={self.mode} | '
-            f'指令速度={self._log_v:.2f} 指令角速度={self._log_w:.2f} '
-            f'实际速度={rv:.2f} | '
-            f'前方距离={self._log_front_d:.2f}m 避障状态={self._log_avoid} '
+            f'[控制] 模式={uturn_mode} | '
+            f'指令速度={self._log_v_cmd:.2f} 指令角速度={self._log_w:.2f}{omega_note}'
+            f' | 实际速度={rv:.2f} | '
+            f'omega原始={self._log_omega_raw:.2f} | '
+            f'前方距离={self._log_front_d:.2f}m 避障={self._log_avoid} '
             f'弯道预判={"是" if turn else "否"} | '
-            f'参考路径点数={len(self.ref)} 跟踪索引={self.ref_idx_hint} | '
+            f'参考路径={len(self.ref)}pt idx={self.ref_idx_hint} | '
             f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}°')
 
     # ── 前方障碍物扫描 ─────────────────────────────────────────────────
@@ -501,6 +602,12 @@ class ControllerNode(Node):
     def _stanley_track(self, rx, ry, ryaw, rv):
         pts = self.ref
         n   = len(pts)
+        # 防御性边界检查：确保 ref_idx_hint 在有效范围内
+        if self.ref_idx_hint >= n:
+            self.ref_idx_hint = n - 1
+        if self.ref_idx_hint < 0:
+            self.ref_idx_hint = 0
+
         lo  = max(0, self.ref_idx_hint - 5)
         hi  = min(n - 1, self.ref_idx_hint + 100)
         sub = pts[lo: hi + 1]
@@ -546,12 +653,13 @@ class ControllerNode(Node):
         delta  = max(-self.delta_max, min(self.delta_max, delta))
 
         kappa   = self._estimate_curvature(idx)
-        v_sched = self.v_target / (1.0 + self.curv_gain * abs(kappa))
+        # 使用 speed_limit 而不是 v_target，确保行为层限速生效
+        v_sched = self.speed_limit / (1.0 + self.curv_gain * abs(kappa))
         v_sched = max(self.v_min, v_sched)
 
         # ── 曲率速度调度 ─────────────────────────────────────────────────
         # 急弯时（kappa 较大）降低速度，确保角速度不超过物理极限
-        omega_max_diff = self.v_target * math.tan(self.delta_max) / self.L
+        omega_max_diff = self.speed_limit * math.tan(self.delta_max) / self.L
         kappa_abs = abs(kappa)
         if kappa_abs > 1e-4:
             v_needed = omega_max_diff / kappa_abs
@@ -566,11 +674,17 @@ class ControllerNode(Node):
         if self._has_upcoming_turn():
             v_sched *= 0.3   # 预警阶段主动降速 70%，提前约 3s 开始减速
 
+        # ── 最终速度上限限制（确保不超过行为层限速）────────────────────
+        v_sched = min(v_sched, self.speed_limit)
+
         return v_sched, omega
 
     def _estimate_curvature(self, idx: int) -> float:
         pts = self.ref
         n   = len(pts)
+        # 防御性边界检查：确保 idx 在有效范围内
+        if n < 5 or idx < 0 or idx >= n:
+            return 0.0
         i0  = max(0, idx - 3)
         i2  = min(n - 1, idx + 3)
         if i2 <= i0:
@@ -579,9 +693,12 @@ class ControllerNode(Node):
         dy = pts[i2][1] - pts[i0][1]
         if math.hypot(dx, dy) < 1e-3:
             return 0.0
+        # 安全访问边界
+        i_next = min(n - 1, idx + 1)
+        i_prev = max(0, idx - 1)
         da  = wrap(math.atan2(dy, dx) - math.atan2(
-            pts[min(n-1, idx+1)][1] - pts[max(0, idx-1)][1],
-            pts[min(n-1, idx+1)][0] - pts[max(0, idx-1)][0]))
+            pts[i_next][1] - pts[i_prev][1],
+            pts[i_next][0] - pts[i_prev][0]))
         arc = math.hypot(dx, dy)
         return da / arc
 

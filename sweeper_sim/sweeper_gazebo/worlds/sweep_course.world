@@ -5,8 +5,15 @@
     <!-- Physics -->
     <physics type="ode">
       <real_time_update_rate>1000</real_time_update_rate>
-      <max_step_size>0.001</max_step_size>
-      <real_time_factor>1</real_time_factor>
+      <max_step_size>0.002</max_step_size>
+      <real_time_factor>0.0</real_time_factor>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>50</iters>
+          <sor>1.3</sor>
+        </solver>
+      </ode>
     </physics>
 
     <!-- Sun light -->
