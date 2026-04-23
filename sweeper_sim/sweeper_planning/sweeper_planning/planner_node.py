@@ -23,6 +23,7 @@ Publishes:
   /planner/path_progress       std_msgs/Float32
 """
 import math
+from enum import Enum, auto
 import os
 import time
 import numpy as np
@@ -43,6 +44,15 @@ def yaw_from_quat(q):
 
 def wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+class PlannerState(Enum):
+    NORMAL = auto()
+    STATIC_DETOUR = auto()
+    DYNAMIC_AVOID = auto()
+    RECOVERY_ACTIVE = auto()
+    POST_RECOVERY_REPLAN = auto()
+    REJOIN_PENDING = auto()
 
 
 class PlannerNode(Node):
@@ -145,13 +155,17 @@ class PlannerNode(Node):
             PoseStamped,     '/perception/gate_pose',           self.cb_gate_pose, 5)
         self.sub_mode      = self.create_subscription(
             String,          '/behavior/mode',                  self.cb_mode,      5)
+        self.sub_recovery_status = self.create_subscription(
+            String,          '/controller/recovery_status',     self.cb_recovery_status, 5)
 
         self.pub_ref   = self.create_publisher(Path,    '/reference_path',        5)
         self.pub_prog  = self.create_publisher(Float32, '/planner/path_progress', 5)
         self.pub_detour_end = self.create_publisher(String, '/planner/detour_cleared', 5)
+        self.pub_rejoin_ready = self.create_publisher(String, '/planner/rejoin_ready', 5)
 
         self.cov_pts: list   = []
         self.robot           = None       # (x, y, yaw)
+        self._robot_speed    = 0.0
         self.mode            = 'COVERAGE'
         self.progress_idx    = 0
         self.obs_memory: dict = {}
@@ -163,7 +177,7 @@ class PlannerNode(Node):
         self.gate_pose       = None     # (cx, cy, yaw) 或 None
         self._gate_pose_t    = 0.0      # 门位姿时间戳
         self._has_area_bounds = True
-        self.known_gates = self._build_known_gates_from_params(g)
+        self.known_gates = []
         self._load_map_config()
         self._active_gate_id = None
         self._in_gate_path = False
@@ -181,6 +195,20 @@ class PlannerNode(Node):
         self._returning_from_detour = False
         self._detour_clear_pending  = False
         self._detour_exit_t         = 0.0
+
+        # 避障方向锁定：防止 bridge/repulsion tick-to-tick 振荡
+        self._last_bridge_sign: float = 0.0
+        self._last_bridge_obs: tuple  = (0.0, 0.0)
+        self._last_bridge_result: list | None = None
+        self._bridge_hold_ticks: int  = 0
+
+        # Unified planner state machine
+        self._planner_state = PlannerState.NORMAL
+        self._controller_recovering = False
+        self._recovery_replan_bridge: list = []
+        self._recovery_replan_target_idx = 0
+        self._cov_version = 0
+        self._cov_version_at_state_entry = 0
 
         # R4: 启动时间戳，用于初始强制 progress_idx=0
         # controller_node 延迟 10s 启动（launch 里 delayed_controller period=10），
@@ -212,7 +240,50 @@ class PlannerNode(Node):
                 f'未从地图文件读取到边界，使用路径推断边界: '
                 f'x=[{self.area_x_min:.1f},{self.area_x_max:.1f}] '
                 f'y=[{self.area_y_min:.1f},{self.area_y_max:.1f}]')
-        self.progress_idx  = 0
+        self._cov_version += 1
+        # coverage_node 会周期性地重发 /coverage/path（_rebuild_timer 约 2s），
+        # 若简单地把 progress_idx 置 0，车辆就会被拉回 coverage 起点，严重违反
+        # 用户强调的 "避障结束后 ConvergePath 优先级最高"。这里除了 warmup 启动阶段，
+        # 其他情况都以当前机器人位置锚定最近点，保留行驶进度。
+        protected = (PlannerState.RECOVERY_ACTIVE,
+                     PlannerState.POST_RECOVERY_REPLAN,
+                     PlannerState.REJOIN_PENDING)
+        if self._planner_state in protected:
+            if self.progress_idx >= len(self.cov_pts):
+                self.progress_idx = max(0, len(self.cov_pts) - 1)
+            self.get_logger().info(
+                f'Coverage path updated during {self._planner_state.name}, '
+                f'preserving progress_idx={self.progress_idx}')
+        elif self.robot is not None and self.cov_pts:
+            rx, ry, _ = self.robot
+            old_idx = self.progress_idx
+            best_i = 0
+            best_d = float('inf')
+            n = len(self.cov_pts)
+            # 先在当前 progress 附近做窗口搜索（避免同一条 coverage 的两段重合时跳远）
+            lo = max(0, min(old_idx, n - 1) - 30)
+            hi = min(n - 1, max(old_idx, 0) + 60)
+            for i in range(lo, hi + 1):
+                px, py = self.cov_pts[i]
+                d = math.hypot(rx - px, ry - py)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_d > 3.0:
+                best_i = 0
+                best_d = float('inf')
+                for i, (px, py) in enumerate(self.cov_pts):
+                    d = math.hypot(rx - px, ry - py)
+                    if d < best_d:
+                        best_d = d
+                        best_i = i
+            self.progress_idx = best_i
+            if old_idx != best_i:
+                self.get_logger().info(
+                    f'[cb_cov reanchor] progress_idx {old_idx}->{best_i} '
+                    f'dist={best_d:.2f}m (state={self._planner_state.name})')
+        else:
+            self.progress_idx = 0
         self._stag_accum_d = 0.0
         self._stag_start_t = time.time()
         self._last_stag_pos = None
@@ -228,6 +299,8 @@ class PlannerNode(Node):
         self.robot = (msg.pose.pose.position.x,
                       msg.pose.pose.position.y,
                       yaw_from_quat(msg.pose.pose.orientation))
+        self._robot_speed = math.hypot(msg.twist.twist.linear.x,
+                                       msg.twist.twist.linear.y)
 
     def cb_obs(self, msg: PolygonStamped):
         now = time.time()
@@ -261,6 +334,12 @@ class PlannerNode(Node):
         raw = msg.data
         self.mode = raw.split('_')[0] if raw.startswith('EDGE_FOLLOW') else raw
 
+    def cb_recovery_status(self, msg: String):
+        if msg.data == 'recovery_start':
+            self._controller_recovering = True
+        elif msg.data == 'recovery_done':
+            self._controller_recovering = False
+
     # ── 主循环 ──────────────────────────────────────────────────────────
     def tick(self):
         if self.robot is None:
@@ -269,7 +348,45 @@ class PlannerNode(Node):
         rx, ry, ryaw = self.robot
         now = time.time()
 
-        # ── 门位姿过期清理 ──
+        # ── unified state machine update ────────────────────────────
+        self._update_planner_state(rx, ry, ryaw, now)
+
+        # ── RECOVERY_ACTIVE: freeze progress, publish static slice ──
+        if self._planner_state == PlannerState.RECOVERY_ACTIVE:
+            if self.cov_pts:
+                end_idx = min(len(self.cov_pts) - 1, self.progress_idx + 40)
+                slice_pts = [(float(x), float(y))
+                             for x, y in self.cov_pts[self.progress_idx:end_idx + 1]]
+                if len(slice_pts) >= 2:
+                    self._publish_path(slice_pts)
+            return
+
+        # ── POST_RECOVERY_REPLAN: build / follow local bridge ───────
+        if self._planner_state == PlannerState.POST_RECOVERY_REPLAN:
+            if not self._recovery_replan_bridge:
+                bridge = self._build_post_recovery_bridge(rx, ry, ryaw)
+                if bridge:
+                    self._recovery_replan_bridge = bridge
+                    self._publish_path(bridge)
+                    return
+                else:
+                    self._transition_state(PlannerState.REJOIN_PENDING,
+                                           'replan_bridge_failed')
+            else:
+                d_to_target = 999.0
+                if (self.cov_pts and
+                        self._recovery_replan_target_idx < len(self.cov_pts)):
+                    tx, ty = self.cov_pts[self._recovery_replan_target_idx]
+                    d_to_target = math.hypot(rx - tx, ry - ty)
+                if d_to_target < 1.5:
+                    self._recovery_replan_bridge = []
+                    self._transition_state(PlannerState.NORMAL,
+                                           'replan_bridge_complete')
+                else:
+                    self._publish_path(self._recovery_replan_bridge)
+                    return
+
+        # ── gate pose timeout ───────────────────────────────────────
         if self.gate_pose and now - self._gate_pose_t > self.gate_pose_timeout_s:
             self.gate_pose = None
 
@@ -332,36 +449,17 @@ class PlannerNode(Node):
         n   = len(self.cov_pts)
         pts = np.array(self.cov_pts)
 
-        # ── 避障模式切换检测：保存/恢复路径位置 ──────────────────────
-        detour_modes = ('STATIC_DETOUR', 'DYNAMIC_AVOID')
-        entering_detour = (self.mode in detour_modes
-                           and self._prev_mode not in detour_modes)
-        leaving_detour  = (self.mode not in detour_modes
-                           and self._prev_mode in detour_modes)
-
-        if entering_detour and self._detour_start_idx is None:
-            self._detour_start_idx = self.progress_idx
-            self._detour_clear_pending = False
-            self.get_logger().info(
-                f'进入避障模式，保存路径位置 idx={self.progress_idx}')
-        if self.mode in detour_modes:
-            self._detour_start_idx = self.progress_idx
-
-        if leaving_detour and self._detour_start_idx is not None:
-            # 进入“待清障”阶段：不要立刻回切原路径，要等车尾也越过障碍。
-            # 否则车头刚过杆子就回切，尾部会扫到杆子。
-            self._detour_clear_pending = True
-            self._detour_exit_t = now
-            self.get_logger().info(
-                f'避障结束，进入尾部清障等待: idx={self.progress_idx}')
-
-        # 尾部清障判定：只有满足“时间 + 距离”双条件才发送 cleared。
-        if self._detour_clear_pending:
-            self._detour_start_idx = self.progress_idx
+        # ── 避障回切评估（状态机驱动）────────────────────────────────
+        if self._planner_state == PlannerState.REJOIN_PENDING:
             min_obs_d = self._nearest_obstacle_distance(rx, ry)
             hold_s = now - self._detour_exit_t
-            if hold_s >= self.rejoin_min_hold_s and min_obs_d >= self.rejoin_tail_clearance:
-                rejoin_idx = self._find_nearest_cov_idx(rx, ry, span_back=30, span_fwd=120)
+            stable_speed = self._robot_speed > 0.03
+            if (hold_s >= self.rejoin_min_hold_s
+                    and min_obs_d >= self.rejoin_tail_clearance
+                    and not self._controller_recovering
+                    and stable_speed):
+                rejoin_idx = self._find_nearest_cov_idx(
+                    rx, ry, span_back=30, span_fwd=120)
                 safe_rejoin_idx = self._advance_to_safe_rejoin_idx(
                     rejoin_idx,
                     clear_threshold=self.rejoin_tail_clearance,
@@ -370,21 +468,21 @@ class PlannerNode(Node):
                 )
                 if safe_rejoin_idx != rejoin_idx:
                     self.get_logger().info(
-                        f'避障回切前推: idx {rejoin_idx}→{safe_rejoin_idx} '
+                        f'avoid rejoin advance: idx {rejoin_idx} -> {safe_rejoin_idx} '
                         f'(clear>={self.rejoin_tail_clearance:.2f}m)')
                 rejoin_idx = safe_rejoin_idx
                 self.get_logger().info(
-                    f'避障回切放行: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m '
+                    f'avoid rejoin ok: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m '
                     f'>= {self.rejoin_tail_clearance:.2f}m, rejoin_idx={rejoin_idx}')
-                self._detour_clear_pending = False
                 self.progress_idx = rejoin_idx
                 self._detour_start_idx = rejoin_idx
                 self._returning_from_detour = True
-                # 通知 behavior_node 和 controller：避障结束，可以恢复路径跟踪
                 self.pub_detour_end.publish(String(data='cleared'))
+                self._transition_state(PlannerState.NORMAL, 'rejoin_conditions_met')
             else:
                 self.get_logger().info(
-                    f'避障回切等待: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m',
+                    f'avoid rejoin wait: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m '
+                    f'speed={self._robot_speed:.2f}',
                     throttle_duration_sec=1.0)
 
         self._prev_mode = self.mode
@@ -404,22 +502,22 @@ class PlannerNode(Node):
                 self._warmup_log_done = True
 
         # ── 前向滑动窗口推进 ────────────────────────────────────────────
+        # 当车辆几乎静止（脱困/碰撞恢复期间）时冻结 progress_idx，
+        # 避免 recovery 期间路径进度漂移导致脱困后跳到远处。
+        robot_stopped = self._robot_speed < 0.03
         old_idx = self.progress_idx
         if in_warmup:
-            # warmup 期间不推进 progress，直接发布头部参考窗口
-            nearest_dist = 0.0  # 占位
+            nearest_dist = 0.0
+        elif robot_stopped:
+            nearest_dist = 0.0
         elif self.progress_idx == 0 and not self._returning_from_detour:
-            # 刚结束 warmup，从 idx=0 开始逐步推进
             window_end = min(n - 1, self.progress_idx + 10)
             sub = pts[self.progress_idx: window_end + 1]
             d2 = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
             nearest_in_window = int(np.argmin(d2))
             nearest_dist = math.sqrt(float(d2[nearest_in_window]))
-            # 只有距离 < 3m 才用 argmin 推进；否则每 tick 推 1 点（等车开到附近）
             if nearest_dist < 3.0:
                 self.progress_idx = max(self.progress_idx, self.progress_idx + nearest_in_window)
-            else:
-                self.progress_idx = min(n - 1, self.progress_idx + 1)
             self.get_logger().debug(f'[DEBUG] 分支1: idx 0→{self.progress_idx}, dist={nearest_dist:.1f}m, pos=({rx:.1f},{ry:.1f})')
         elif self._returning_from_detour:
             window_end = min(n - 1, self.progress_idx + 50)
@@ -434,9 +532,6 @@ class PlannerNode(Node):
                 self.get_logger().info(
                     f'已回到原路径, dist={nearest_dist:.2f}m')
         else:
-            # 小窗口 argmin：限制为 +3 点，确保不跳过 U-turn 弧桥。
-            # tick=0.2s, v_max≈0.6m/s → 每 tick 行进 ≈0.12m；
-            # 路径点间距 ~0.25-0.5m，+3 已覆盖所有合理推进。
             MAX_STEP = 3
             window_end = min(n - 1, self.progress_idx + MAX_STEP)
             sub  = pts[self.progress_idx: window_end + 1]
@@ -446,7 +541,7 @@ class PlannerNode(Node):
             if nearest_dist < 3.0:
                 new_idx = self.progress_idx + argmin_rel
             else:
-                new_idx = min(n - 1, self.progress_idx + 1)
+                new_idx = self.progress_idx
             old_progress = self.progress_idx
             self.progress_idx = max(self.progress_idx, new_idx)
 
@@ -523,7 +618,8 @@ class PlannerNode(Node):
         elapsed = now - self._stag_start_t
         if elapsed >= self.stag_time:
             if (self._stag_accum_d < self.stag_min_d
-                    and self.mode in ('COVERAGE', 'STATIC_DETOUR')):
+                    and self.mode in ('COVERAGE', 'STATIC_DETOUR')
+                    and not robot_stopped):
                 jump = min(n - 1, self.progress_idx + 20)
                 self.get_logger().warn(
                     f'停滞 {elapsed:.1f}s / {self._stag_accum_d:.2f}m — '
@@ -592,11 +688,31 @@ class PlannerNode(Node):
             if bridge_detour is not None:
                 slice_pts, hit_obs, hit_clear, min_clear = bridge_detour
                 used_structured_detour = True
+                self._last_bridge_result = slice_pts[:]
+                self._bridge_hold_ticks = 5
                 self.get_logger().info(
                     f'[BRIDGE_DETOUR] obstacle=({hit_obs[0]:.1f},{hit_obs[1]:.1f}) '
                     f'nearest={hit_clear:.2f}m min_clear={min_clear:.2f}m '
                     f'progress_idx={self.progress_idx}',
                     throttle_duration_sec=0.5)
+            elif self._bridge_hold_ticks > 0 and self._last_bridge_result is not None:
+                # Bridge rejected this tick but was active recently — hold
+                # previous result to prevent bridge/repulsion oscillation.
+                self._bridge_hold_ticks -= 1
+                if len(self._last_bridge_result) == len(slice_pts):
+                    alpha = 0.5 + 0.5 * (self._bridge_hold_ticks / 5.0)
+                    blended = []
+                    for i in range(len(slice_pts)):
+                        bx = alpha * self._last_bridge_result[i][0] + (1.0 - alpha) * slice_pts[i][0]
+                        by = alpha * self._last_bridge_result[i][1] + (1.0 - alpha) * slice_pts[i][1]
+                        blended.append((bx, by))
+                    slice_pts = blended
+                    used_structured_detour = True
+                if self._bridge_hold_ticks <= 0:
+                    self._last_bridge_result = None
+            else:
+                self._bridge_hold_ticks = 0
+                self._last_bridge_result = None
             if not used_structured_detour:
                 slice_pts = self._apply_detour(slice_pts)
             max_shift = 0.0
@@ -633,7 +749,7 @@ class PlannerNode(Node):
         else:
             d_to_prog = -1.0
         self.get_logger().info(
-            f'[规划] 模式={self.mode} | '
+            f'[规划] 模式={self.mode} 状态={self._planner_state.name} | '
             f'路径进度={self.progress_idx}/{n} ({pct:.1f}%) | '
             f'静态障碍记忆={len(self.obs_memory)}个 '
             f'动态障碍={len(self.dyn_obstacles)}个 | '
@@ -736,9 +852,8 @@ class PlannerNode(Node):
         if not self.cov_pts:
             return float('inf')
         n = len(self.cov_pts)
-        # ConvergePath: 以当前 progress 为中心的局部跟踪段，而非全局 coverage。
-        lo = max(0, self.progress_idx - 30)
-        hi = min(n - 1, self.progress_idx + 140)
+        lo = max(0, self.progress_idx - 10)
+        hi = min(n - 1, self.progress_idx + 60)
         return self._distance_to_path_range(px, py, lo, hi)
 
     def _refresh_gate_path_distances(self):
@@ -786,11 +901,32 @@ class PlannerNode(Node):
                     return False
         return True
 
+    def _gate_along_path_distance(self, gx: float, gy: float) -> float:
+        """Return the arc-length from progress_idx to the nearest path point
+        close to the gate.  Only searches forward (progress_idx .. +60).
+        Returns inf if the gate is not near the upcoming path."""
+        if not self.cov_pts:
+            return float('inf')
+        n = len(self.cov_pts)
+        lo = self.progress_idx
+        hi = min(n - 1, self.progress_idx + 60)
+        best_seg_d = float('inf')
+        best_arc   = float('inf')
+        arc = 0.0
+        for i in range(lo, hi):
+            px, py = self.cov_pts[i]
+            d = math.hypot(gx - px, gy - py)
+            if d < best_seg_d:
+                best_seg_d = d
+                best_arc = arc
+            if i + 1 <= hi:
+                arc += math.hypot(self.cov_pts[i+1][0] - px,
+                                  self.cov_pts[i+1][1] - py)
+        if best_seg_d > self.gate_path_max_dist:
+            return float('inf')
+        return best_arc
+
     def _select_gate_target(self, rx: float, ry: float):
-        # 优先级：
-        # 1) ConvergePath（门必须贴近 coverage path，且权重最高）
-        # 2) 触发避障模式时禁止穿门，优先避障
-        # 3) 门路径必须通过碰撞检查
         if self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID', 'STOP'):
             return None
 
@@ -801,12 +937,18 @@ class PlannerNode(Node):
             if robot_dist > self.gate_engage_dist:
                 continue
             path_dist = self._distance_to_converge_path(gate['x'], gate['y'])
-            global_path_dist = gate.get('path_dist', float('inf'))
             if self.force_gate_near_path_only and path_dist > self.gate_path_max_dist:
                 self.get_logger().info(
                     f'跳过强制穿门: gate={gate["id"]} '
-                    f'距ConvergePath{path_dist:.2f}m (全局{global_path_dist:.2f}m) '
+                    f'距ConvergePath{path_dist:.2f}m '
                     f'> 阈值{self.gate_path_max_dist:.2f}m',
+                    throttle_duration_sec=2.0)
+                continue
+            arc_dist = self._gate_along_path_distance(gate['x'], gate['y'])
+            if arc_dist < 2.0 or arc_dist > 15.0:
+                self.get_logger().info(
+                    f'跳过强制穿门: gate={gate["id"]} '
+                    f'沿路径距离{arc_dist:.1f}m 不在 [2,15]m 范围',
                     throttle_duration_sec=2.0)
                 continue
             if not self._is_gate_path_collision_free(
@@ -815,7 +957,6 @@ class PlannerNode(Node):
                     f'跳过强制穿门: gate={gate["id"]} 路径碰撞风险',
                     throttle_duration_sec=2.0)
                 continue
-            # ConvergePath 权重最高：优先选择更贴近 coverage path 的门
             score = (self.gate_converge_path_weight * path_dist
                      + self.gate_robot_dist_weight * robot_dist)
             gate_candidates.append((score, gate, robot_dist, path_dist))
@@ -972,8 +1113,7 @@ class PlannerNode(Node):
                     'id': gid, 'x': gx, 'y': gy, 'yaw': gh,
                     'passed': False, 'path_dist': float('inf')
                 })
-        if parsed_gates:
-            self.known_gates = parsed_gates
+        self.known_gates = parsed_gates
         self.get_logger().info(
             f'地图配置已加载: bounds=({self.area_x_min:.1f},{self.area_x_max:.1f},'
             f'{self.area_y_min:.1f},{self.area_y_max:.1f}) gates={len(self.known_gates)}')
@@ -1142,8 +1282,10 @@ class PlannerNode(Node):
         )
 
         current_clear = self._segment_min_clearance(pts, start_i, end_i)
-        best_choice = None
-        best_score = -float('inf')
+        choices = {}
+
+        same_obs = (math.hypot(ox - self._last_bridge_obs[0],
+                               oy - self._last_bridge_obs[1]) < 1.0)
 
         for sign in (1.0, -1.0):
             out = pts[:]
@@ -1161,9 +1303,20 @@ class PlannerNode(Node):
             )
             away_bonus = -sign * math.copysign(1.0, lateral_err) if abs(lateral_err) > 1e-3 else 0.0
             score = min_clear + 0.35 * hit_clear + 0.15 * away_bonus
-            if score > best_score:
-                best_score = score
-                best_choice = (out, hit_clear, min_clear)
+            choices[sign] = (score, out, hit_clear, min_clear)
+
+        best_sign = max(choices, key=lambda s: choices[s][0])
+        if (same_obs and self._last_bridge_sign != 0.0
+                and best_sign != self._last_bridge_sign):
+            prev_score = choices.get(self._last_bridge_sign, (0.0,))[0]
+            new_score = choices[best_sign][0]
+            if new_score - prev_score < 0.3:
+                best_sign = self._last_bridge_sign
+
+        self._last_bridge_sign = best_sign
+        self._last_bridge_obs = (ox, oy)
+        best_score, out_best, hit_clear, min_clear = choices[best_sign]
+        best_choice = (out_best, hit_clear, min_clear)
 
         if best_choice is None:
             return None
@@ -1217,6 +1370,151 @@ class PlannerNode(Node):
             if d < best:
                 best = d
         return best
+
+    # ── Unified planner state machine ───────────────────────────────────
+
+    def _transition_state(self, new_state: 'PlannerState', reason: str = ''):
+        old = self._planner_state
+        if old == new_state:
+            return
+        rx = self.robot[0] if self.robot else 0.0
+        ry = self.robot[1] if self.robot else 0.0
+        min_obs = self._nearest_obstacle_distance(rx, ry) if self.robot else 999.0
+        self.get_logger().info(
+            f'[STATE] {old.name} -> {new_state.name} | reason={reason} | '
+            f'mode={self.mode} progress_idx={self.progress_idx} '
+            f'min_obs_d={min_obs:.2f}m pos=({rx:.1f},{ry:.1f})')
+        if new_state in (PlannerState.STATIC_DETOUR, PlannerState.DYNAMIC_AVOID):
+            if self._detour_start_idx is None:
+                self._detour_start_idx = self.progress_idx
+        elif new_state == PlannerState.RECOVERY_ACTIVE:
+            self._detour_clear_pending = False
+            self._bridge_hold_ticks = 0
+            self._last_bridge_result = None
+        elif new_state == PlannerState.POST_RECOVERY_REPLAN:
+            self._recovery_replan_bridge = []
+        elif new_state == PlannerState.NORMAL:
+            self._detour_start_idx = None
+            self._detour_clear_pending = False
+        self._planner_state = new_state
+        self._cov_version_at_state_entry = self._cov_version
+
+    def _update_planner_state(self, rx: float, ry: float,
+                              ryaw: float, now: float):
+        """Evaluate and apply state transitions based on current inputs."""
+        state = self._planner_state
+        detour_modes = ('STATIC_DETOUR', 'DYNAMIC_AVOID')
+
+        if self._controller_recovering:
+            if state != PlannerState.RECOVERY_ACTIVE:
+                self._transition_state(PlannerState.RECOVERY_ACTIVE,
+                                       'controller_recovery_start')
+            return
+
+        if state == PlannerState.RECOVERY_ACTIVE:
+            self._transition_state(PlannerState.POST_RECOVERY_REPLAN,
+                                   'controller_recovery_done')
+            return
+
+        if state == PlannerState.POST_RECOVERY_REPLAN:
+            return
+
+        if state == PlannerState.REJOIN_PENDING:
+            if self.mode in detour_modes:
+                expected = (PlannerState.STATIC_DETOUR
+                            if self.mode == 'STATIC_DETOUR'
+                            else PlannerState.DYNAMIC_AVOID)
+                self._transition_state(expected, 're-enter_detour')
+            return
+
+        if self.mode in detour_modes:
+            expected = (PlannerState.STATIC_DETOUR
+                        if self.mode == 'STATIC_DETOUR'
+                        else PlannerState.DYNAMIC_AVOID)
+            if state != expected:
+                self._transition_state(expected,
+                                       f'behavior_mode={self.mode}')
+        elif state in (PlannerState.STATIC_DETOUR, PlannerState.DYNAMIC_AVOID):
+            self._transition_state(PlannerState.REJOIN_PENDING, 'leaving_detour')
+            self._detour_exit_t = now
+        elif state != PlannerState.NORMAL:
+            self._transition_state(PlannerState.NORMAL, 'default')
+
+    def _build_post_recovery_bridge(self, rx: float, ry: float,
+                                    ryaw: float) -> list:
+        """Build a smooth Hermite bridge from current pose to a safe coverage
+        rejoin point after stuck-recovery completes."""
+        if not self.cov_pts:
+            return []
+        n = len(self.cov_pts)
+        nearest_idx = self._find_nearest_cov_idx(
+            rx, ry, span_back=40, span_fwd=120)
+        safe_idx = self._advance_to_safe_rejoin_idx(
+            nearest_idx,
+            clear_threshold=self.rejoin_tail_clearance * 1.5,
+            search_ahead=80,
+            min_advance=15,
+        )
+        safe_idx = min(safe_idx, n - 1)
+        tx, ty = self.cov_pts[safe_idx]
+        dist = math.hypot(rx - tx, ry - ty)
+        if dist < 0.5:
+            self.progress_idx = safe_idx
+            return []
+
+        if safe_idx + 1 < n:
+            t_yaw = math.atan2(self.cov_pts[safe_idx + 1][1] - ty,
+                               self.cov_pts[safe_idx + 1][0] - tx)
+        elif safe_idx > 0:
+            t_yaw = math.atan2(ty - self.cov_pts[safe_idx - 1][1],
+                               tx - self.cov_pts[safe_idx - 1][0])
+        else:
+            t_yaw = ryaw
+
+        tangent_scale = dist * 0.6
+        m0x = tangent_scale * math.cos(ryaw)
+        m0y = tangent_scale * math.sin(ryaw)
+        m1x = tangent_scale * math.cos(t_yaw)
+        m1y = tangent_scale * math.sin(t_yaw)
+
+        steps = max(10, int(dist / 0.3))
+        bridge = []
+        for i in range(steps + 1):
+            t = i / float(steps)
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+            h10 = t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h11 = t3 - t2
+            bx = h00 * rx + h10 * m0x + h01 * tx + h11 * m1x
+            by = h00 * ry + h10 * m0y + h01 * ty + h11 * m1y
+            bridge.append((bx, by))
+
+        min_safe = max(self.inflate + 0.1, self.vehicle_width * 0.5 + 0.15)
+        needs_adjust = False
+        for bx, by in bridge:
+            for ox, oy in self.obs_memory.keys():
+                if math.hypot(bx - ox, by - oy) < min_safe:
+                    needs_adjust = True
+                    break
+            if needs_adjust:
+                break
+        if needs_adjust:
+            bridge = self._apply_detour(bridge)
+
+        tail_count = min(20, n - safe_idx - 1)
+        for i in range(1, tail_count + 1):
+            ci = safe_idx + i
+            if ci < n:
+                bridge.append(self.cov_pts[ci])
+
+        self._recovery_replan_target_idx = safe_idx
+        self.progress_idx = safe_idx
+        self.get_logger().info(
+            f'[POST_RECOVERY_REPLAN] bridge={len(bridge)}pts, '
+            f'target_idx={safe_idx}, dist={dist:.2f}m')
+        return bridge
 
     def _find_nearest_cov_idx(self, rx: float, ry: float, span_back: int = 20, span_fwd: int = 80) -> int:
         if not self.cov_pts:

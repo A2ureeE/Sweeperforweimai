@@ -82,9 +82,9 @@ class ControllerNode(Node):
             ('side_scan_angle_min_deg',  70.0),
             ('side_scan_angle_max_deg', 110.0),
             # 前方反应式避障
-            ('obstacle_slow_dist',       1.2),
-            ('obstacle_steer_dist',      0.8),
-            ('obstacle_stop_dist',       0.45),
+            ('obstacle_slow_dist',       0.8),
+            ('obstacle_steer_dist',      0.5),
+            ('obstacle_stop_dist',       0.3),
             ('front_scan_half_angle_deg', 30.0),
             ('avoidance_omega_gain',     0.5),
         ])
@@ -138,6 +138,7 @@ class ControllerNode(Node):
         self._delay_done    = False  # 延迟是否已完成
 
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 5)
+        self.pub_recovery_status = self.create_publisher(String, '/controller/recovery_status', 5)
 
         # 恢复指令订阅（来自 behavior_node，避障结束后回归原路径）
         self.sub_recovery = self.create_subscription(
@@ -172,6 +173,7 @@ class ControllerNode(Node):
         self._rec_turn_dir = 1.0
         self._rec_mode = 'COVERAGE'
         self._rec_turn_pref = 1.0
+        self._resume_pending = False
 
         # 壁面 PD 状态
         self._wall_err_prev = 0.0
@@ -231,6 +233,26 @@ class ControllerNode(Node):
         if not self._entry_locked and self.robot is not None and self.ref:
             self._fix_entry_point()
             self._entry_locked = True
+            return
+
+        # 入口锁定后：每次 reference_path 更新都可能是内容级别的替换
+        # （例如 POST_RECOVERY_REPLAN 桥接结束切回 coverage slice），
+        # 老的 ref_idx_hint 在新 ref 上可能指向远处而非当前位置。
+        # 若 ref[hint] 距车辆较远，则回到最近点；否则保持 monotonic 跟踪。
+        if self._entry_locked and self.ref and self.robot is not None:
+            rx, ry, _, _ = self.robot
+            n_ref = len(self.ref)
+            hint = max(0, min(self.ref_idx_hint, n_ref - 1))
+            hx, hy, _ = self.ref[hint]
+            dist_hint = math.hypot(rx - hx, ry - hy)
+            if dist_hint > 2.0 or self.ref_idx_hint >= n_ref:
+                best_i, best_d = self._nearest_ref_idx(rx, ry)
+                old_hint = self.ref_idx_hint
+                self.ref_idx_hint = best_i
+                self.get_logger().info(
+                    f'[ref_reanchor] hint {old_hint}->{best_i} '
+                    f'dist_old={dist_hint:.2f}m dist_new={best_d:.2f}m '
+                    f'ref_len={n_ref}')
 
     def cb_odom(self, msg: Odometry):
         x   = msg.pose.pose.position.x
@@ -315,6 +337,11 @@ class ControllerNode(Node):
 
     def cb_recovery(self, msg):
         if msg.data == 'resume_coverage':
+            if self._recovering:
+                self._resume_pending = True
+                self.get_logger().info(
+                    'resume_coverage deferred: recovery still active')
+                return
             if self.robot is not None and self.ref:
                 rx, ry, _, _ = self.robot
                 self.ref_idx_hint, _ = self._nearest_ref_idx(rx, ry)
@@ -342,6 +369,7 @@ class ControllerNode(Node):
         self.get_logger().warn(
             f'Stuck 检测触发 — 恢复模式 mode={self.mode} '
             f'front={front_d:.2f}m turn={"left" if self._rec_turn_dir > 0 else "right"}')
+        self.pub_recovery_status.publish(String(data='recovery_start'))
 
     def _apply_recovery_cmd(self, now_s: float, cmd: Twist, front_d: float) -> bool:
         if not self._recovering:
@@ -352,6 +380,11 @@ class ControllerNode(Node):
             self._rec_end_t = 0.0
             self.ref_idx_hint, _ = self._nearest_ref_idx(self.robot[0], self.robot[1])
             self._pos_history.clear()
+            self.pub_recovery_status.publish(String(data='recovery_done'))
+            if self._resume_pending:
+                self._resume_pending = False
+                self.get_logger().info(
+                    'Recovery done, applying deferred resume_coverage')
             return False
 
         elapsed = now_s - self._rec_start_t
@@ -505,8 +538,6 @@ class ControllerNode(Node):
 
             emergency_stop = False
             avoid_label = 'none'
-            # 避障层的转向权重：avoid_gain 原为角速度增益（rad/s），
-            # 现按"等效 steering angle"使用。0.5 rad ≈ 28.6°，合理。
             if front_d < eff_stop:
                 v = 0.0
                 delta = steer_dir * self.avoid_gain
@@ -540,8 +571,7 @@ class ControllerNode(Node):
             self._log_omega_raw = omega
             self._log_omega_clamped = False
         else:
-            # U-turn 模式：直接使用 PP 算出的 delta，保证最低速度以产生足够牵引
-            v = max(v, 0.22)  # U-turn 最低速度 0.22 m/s（克服起步摩擦）
+            v = max(v, 0.22)
             delta = max(-self.delta_max, min(self.delta_max, delta))
 
             front_d, steer_dir = self._front_obstacle_info()
@@ -596,7 +626,6 @@ class ControllerNode(Node):
         if n < 5:
             return False
         idx = max(0, min(self.ref_idx_hint, n - 1))
-        # 阈值 0.25 rad/m 对应 4m 转弯半径，能捕捉 Headland(1.95m) 与 U-turn(1.95m) 圆弧
         for offset in [5, 10, 20, 30, 40, 50]:
             ci = min(n - 1, idx + offset)
             kappa = abs(self._estimate_curvature(ci))
@@ -1117,7 +1146,7 @@ class ControllerNode(Node):
         in_curve  = local_kappa_abs > 0.25
         at_ref_end = (idx >= n - 3)     # idx 接近窗口末尾时 Stanley 不可靠
         if off_track or in_curve or at_ref_end:
-            Ld = max(1.2, 2.5 * max(0.15, rv))  # 前视距离随速度增加
+            Ld = max(1.2, 2.5 * max(0.15, rv))
             tgt_i = idx
             acc = 0.0
             while tgt_i + 1 < n:
@@ -1164,24 +1193,6 @@ class ControllerNode(Node):
         # 其中 L = wheel_base = 1.05m（前后轴中心距）
         omega = v_sched * math.tan(delta) / self.L
 
-        # ── 弯道预警降速：渐进式 + 距离感知 ──────────────────────────────
-        # 问题背景：URDF 插件实际速度 = 指令 * (0.44/0.15) ≈ 2.93x（wheel_diameter
-        # 标签被插件忽略，使用默认 actuated_wheel_diameter=0.15m）。
-        # 指令 0.2 m/s → 实跑 0.59 m/s。过 1.95m 半径 Headland 90° 角需要
-        # 实际速度 < 0.2 m/s 才跟得住，对应指令 < 0.07 m/s。
-        # 策略：根据距最近急弯的距离线性减速——
-        #   d ≥ 5m: v_sched 不变（直道全速）
-        #   d ≤ 0.5m: v_sched × 0.15 (急弯中最低)
-        #   0.5-5m: 线性插值
-        turn_dist = self._upcoming_turn_distance()
-        if turn_dist < 5.0:
-            # 距弯道 5m 起开始减速，越近减得越多
-            # 最低 0.06 m/s (实跑≈0.18)：之前 0.03 在 Headland 弯角处速度太低
-            # 导致 Ackermann 转弯极慢，在 NW 角处卡死 30s+
-            factor = max(0.30, min(1.0, (turn_dist - 0.5) / 4.5 * 0.70 + 0.30))
-            v_sched = max(0.06, v_sched * factor)
-
-        # ── 最终速度上限限制（确保不超过行为层限速）────────────────────
         v_sched = min(v_sched, self.speed_limit)
 
         return v_sched, omega, delta

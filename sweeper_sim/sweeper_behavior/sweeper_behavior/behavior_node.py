@@ -120,6 +120,11 @@ class BehaviorNode(Node):
             String, '/planner/detour_cleared', self.cb_detour_cleared, 5)
         self._detour_cleared = False
 
+        self.sub_recovery_status = self.create_subscription(
+            String, '/controller/recovery_status', self.cb_recovery_status, 5)
+        self._controller_recovering = False
+        self._pending_detour_cleared = False
+
         # Robot state (world frame)
         self._robot_pos  = (0.0, 0.0)
         self.robot_yaw   = 0.0
@@ -189,6 +194,17 @@ class BehaviorNode(Node):
     def cb_detour_cleared(self, msg):
         if msg.data == 'cleared':
             self._detour_cleared = True
+
+    def cb_recovery_status(self, msg):
+        if msg.data == 'recovery_start':
+            self._controller_recovering = True
+        elif msg.data == 'recovery_done':
+            self._controller_recovering = False
+            if self._pending_detour_cleared:
+                self._pending_detour_cleared = False
+                self.pub_recovery.publish(String(data='resume_coverage'))
+                self.get_logger().info(
+                    'Recovery done + detour cleared → resume_coverage')
 
     # ── 工具函数 ─────────────────────────────────────────────────────────
     def _front_clear_dist(self) -> float:
@@ -381,8 +397,13 @@ class BehaviorNode(Node):
         # 避障结束：从保存的路径索引恢复，继续 Coverage
         if self._detour_cleared:
             self._detour_cleared = False
-            self.pub_recovery.publish(String(data='resume_coverage'))
-            self.get_logger().info('避障结束，发送 resume_coverage 恢复指令')
+            if self._controller_recovering:
+                self._pending_detour_cleared = True
+                self.get_logger().info(
+                    '避障结束但 recovery 进行中，延迟 resume_coverage')
+            else:
+                self.pub_recovery.publish(String(data='resume_coverage'))
+                self.get_logger().info('避障结束，发送 resume_coverage 恢复指令')
 
         # ⑥ 避障退出后速度渐进恢复，防止突然加速撞上下一个障碍
         in_detour_now = mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID')
