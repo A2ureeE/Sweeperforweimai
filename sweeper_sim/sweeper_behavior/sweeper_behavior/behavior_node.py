@@ -15,6 +15,7 @@ Publishes:
   /behavior/speed_limit std_msgs/Float32  (10 Hz)
 """
 import math
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
@@ -130,6 +131,11 @@ class BehaviorNode(Node):
 
         self._last_mode  = 'COVERAGE'
         self._last_speed = self.normal_speed
+
+        # 避障退出后速度渐进恢复
+        self._post_detour_t       = 0.0
+        self._post_detour_ramp_s  = 2.0
+        self._in_detour_last_tick = False
 
         self.create_timer(0.1, self.tick)
         self.create_timer(5.0, self._log_status)
@@ -317,6 +323,18 @@ class BehaviorNode(Node):
             self._detour_cleared = False
             self.pub_recovery.publish(String(data='resume_coverage'))
             self.get_logger().info('避障结束，发送 resume_coverage 恢复指令')
+
+        # ⑥ 避障退出后速度渐进恢复，防止突然加速撞上下一个障碍
+        in_detour_now = mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID')
+        if self._in_detour_last_tick and not in_detour_now:
+            self._post_detour_t = time.time()
+        self._in_detour_last_tick = in_detour_now
+
+        if not in_detour_now and mode == 'COVERAGE':
+            ramp_elapsed = time.time() - self._post_detour_t
+            if 0.0 < ramp_elapsed < self._post_detour_ramp_s:
+                t = ramp_elapsed / self._post_detour_ramp_s
+                speed_lim = self.detour_speed + (self.normal_speed - self.detour_speed) * t
 
         self._publish(mode, speed_lim)
 

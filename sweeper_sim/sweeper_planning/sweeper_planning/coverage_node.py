@@ -561,6 +561,8 @@ class CoverageNode(Node):
         # ── R1.3: pts 连续性自检 ─────────────────────────────────────
         self._check_path_continuity(pts, label='Skip-Row')
 
+        pass
+
         return pts
 
     def _lane_with_detours(self, lane_y, going_right, x_start, x_end,

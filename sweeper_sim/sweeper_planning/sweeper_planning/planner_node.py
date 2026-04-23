@@ -253,8 +253,6 @@ class PlannerNode(Node):
         in_warmup = warmup_elapsed < self._warmup_sec
         if in_warmup:
             self.progress_idx = 0
-            # warmup 期间持续重置 stagnation 计时器，防止 warmup 结束时
-            # stagnation 立即把 progress 跳 +20 跳过外环
             self._stag_accum_d = 0.0
             self._stag_start_t = now
             if not self._warmup_log_done:
@@ -295,9 +293,11 @@ class PlannerNode(Node):
                 self.get_logger().info(
                     f'已回到原路径, dist={nearest_dist:.2f}m')
         else:
-            # 搜索窗口 +30 点（~10m），在正常跟随时 argmin 推进若干点；
-            # 大脱线时 argmin 可能跳到后段，用距离 gating 避免跳跃。
-            window_end = min(n - 1, self.progress_idx + 30)
+            # 小窗口 argmin：限制为 +3 点，确保不跳过 U-turn 弧桥。
+            # tick=0.2s, v_max≈0.6m/s → 每 tick 行进 ≈0.12m；
+            # 路径点间距 ~0.25-0.5m，+3 已覆盖所有合理推进。
+            MAX_STEP = 3
+            window_end = min(n - 1, self.progress_idx + MAX_STEP)
             sub  = pts[self.progress_idx: window_end + 1]
             d2   = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
             argmin_rel = int(np.argmin(d2))
@@ -305,8 +305,8 @@ class PlannerNode(Node):
             if nearest_dist < 3.0:
                 new_idx = self.progress_idx + argmin_rel
             else:
-                # 距离过大：progress 不跳跃，只推进 1 点，交给控制器把车拉回
                 new_idx = min(n - 1, self.progress_idx + 1)
+            old_progress = self.progress_idx
             self.progress_idx = max(self.progress_idx, new_idx)
 
         # R4 诊断：启动后 20 秒内每次 progress_idx 变化都打印一行
@@ -323,12 +323,50 @@ class PlannerNode(Node):
             px, py = pts[self.progress_idx]
             d_prog = math.hypot(rx - float(px), ry - float(py))
             if d_prog > 4.0:
-                lo = max(0, self.progress_idx - 80)
-                hi = min(n - 1, self.progress_idx + 80)
-                sub = pts[lo:hi + 1]
-                d2 = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
-                rel = int(np.argmin(d2))
-                new_idx = lo + rel
+                # 前向搜索上界：用路径折返检测（不跨越 U-turn）
+                hi_fwd = self.progress_idx
+                _rs_x0 = float(pts[self.progress_idx][0])
+                _rs_y0 = float(pts[self.progress_idx][1])
+                _rs_dist = 0.0
+                _rs_max_chord = 0.0
+                _rs_max_arc = 0.0
+                while hi_fwd + 1 < n and hi_fwd < self.progress_idx + 80:
+                    _dx_r = float(pts[hi_fwd + 1][0] - pts[hi_fwd][0])
+                    _dy_r = float(pts[hi_fwd + 1][1] - pts[hi_fwd][1])
+                    _rs_dist += math.hypot(_dx_r, _dy_r)
+                    hi_fwd += 1
+                    _rs_chord = math.hypot(float(pts[hi_fwd][0]) - _rs_x0,
+                                           float(pts[hi_fwd][1]) - _rs_y0)
+                    if _rs_chord > _rs_max_chord:
+                        _rs_max_chord = _rs_chord
+                        _rs_max_arc = _rs_dist
+                    if (_rs_max_chord > 2.0
+                            and _rs_chord < _rs_max_chord * 0.5
+                            and _rs_dist > _rs_max_arc + 1.0):
+                        break
+                sub_fwd = pts[self.progress_idx:hi_fwd + 1]
+                d2_fwd = np.sum((sub_fwd - np.array([rx, ry])) ** 2, axis=1)
+                rel_fwd = int(np.argmin(d2_fwd))
+                fwd_dist = math.sqrt(float(d2_fwd[rel_fwd]))
+                new_idx = self.progress_idx + rel_fwd
+
+                if fwd_dist > 4.0:
+                    lo_bwd = max(0, self.progress_idx - 20)
+                    sub_bwd = pts[lo_bwd:self.progress_idx]
+                    if len(sub_bwd) > 0:
+                        d2_bwd = np.sum((sub_bwd - np.array([rx, ry])) ** 2, axis=1)
+                        rel_bwd = int(np.argmin(d2_bwd))
+                        bwd_dist = math.sqrt(float(d2_bwd[rel_bwd]))
+                        if bwd_dist < fwd_dist:
+                            new_idx = lo_bwd + rel_bwd
+                            self.get_logger().warn(
+                                f'[progress_resync] backward fallback '
+                                f'idx {self.progress_idx}→{new_idx} '
+                                f'd_fwd={fwd_dist:.1f}m d_bwd={bwd_dist:.1f}m '
+                                f'pos=({rx:.1f},{ry:.1f})')
+
+                new_idx = max(self.progress_idx - 20, new_idx)
+
                 self.get_logger().warn(
                     f'[progress_resync] idx {self.progress_idx}→{new_idx} '
                     f'd={d_prog:.1f}m pos=({rx:.1f},{ry:.1f})')
@@ -357,14 +395,34 @@ class PlannerNode(Node):
         self.pub_prog.publish(Float32(data=prog))
 
         # ── 截取参考窗口 ─────────────────────────────────────────────
+        # 距离约束 + 路径折返检测：
+        #   1) 沿路径累积距离达到 lookahead 时截断
+        #   2) 当路径上某点离起点的直线距离开始"回缩"（折返），说明
+        #      路径正在 U-turn 折回，继续暴露会让 controller 跳线。
+        #      折返条件：当前点到起点距离 < 已见最远距离 × 0.5 且已走超
+        #      过最远距离的一半弧长（避免在 bridge 起步微小抖动误判）。
+        start_x = float(pts[self.progress_idx][0])
+        start_y = float(pts[self.progress_idx][1])
         end_idx  = self.progress_idx
         dist_acc = 0.0
+        max_chord = 0.0
+        max_chord_arc = 0.0
         while end_idx + 1 < n:
             dx = pts[end_idx + 1][0] - pts[end_idx][0]
             dy = pts[end_idx + 1][1] - pts[end_idx][1]
-            dist_acc += math.hypot(dx, dy)
+            seg_len = math.hypot(dx, dy)
+            dist_acc += seg_len
             end_idx  += 1
+            chord = math.hypot(float(pts[end_idx][0]) - start_x,
+                               float(pts[end_idx][1]) - start_y)
+            if chord > max_chord:
+                max_chord = chord
+                max_chord_arc = dist_acc
             if dist_acc >= self.lookahead:
+                break
+            if (max_chord > 2.0
+                    and chord < max_chord * 0.5
+                    and dist_acc > max_chord_arc + 1.0):
                 break
 
         slice_pts = [tuple(p) for p in pts[self.progress_idx: end_idx + 1]]
@@ -378,7 +436,21 @@ class PlannerNode(Node):
 
         # ── 静态障碍物侧向推开 ──────────────────────────────────────
         if self.mode in ('COVERAGE', 'STATIC_DETOUR'):
+            pre_detour = slice_pts[:]
             slice_pts = self._apply_detour(slice_pts)
+            max_shift = 0.0
+            for i in range(len(slice_pts)):
+                sh = math.hypot(slice_pts[i][0] - pre_detour[i][0],
+                                slice_pts[i][1] - pre_detour[i][1])
+                if sh > max_shift:
+                    max_shift = sh
+            if max_shift > 0.05:
+                self.get_logger().info(
+                    f'[DETOUR_DIAG] progress_idx={self.progress_idx} end_idx={end_idx} '
+                    f'窗口{len(slice_pts)}点 最大偏移={max_shift:.2f}m '
+                    f'障碍数={len(self.obs_memory)} '
+                    f'pos=({rx:.1f},{ry:.1f}) 模式={self.mode}',
+                    throttle_duration_sec=0.5)
 
         # ── 动态障碍物横向整体偏移 ───────────────────────────────────
         if self.mode == 'DYNAMIC_AVOID':

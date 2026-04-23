@@ -194,6 +194,11 @@ class ControllerNode(Node):
         self._uturn_prev_yaw  = 0.0     # 上一 tick 的 yaw（用于增量累计）
         self._uturn_signed_cum = 0.0   # U-turn 期间"带符号"累计旋转（可超 ±π）
 
+        # 避障退出冷却：退出 STATIC_DETOUR/DYNAMIC_AVOID 后 2s 内禁止进入 U-turn
+        self._prev_mode_ctrl      = 'COVERAGE'
+        self._detour_exit_time    = 0.0
+        self._uturn_detour_cooldown_s = 2.0
+
         self.create_timer(self.dt, self.tick)
         self.create_timer(1.0, self._log_status)
         self.get_logger().info('controller_node ready')
@@ -282,6 +287,11 @@ class ControllerNode(Node):
             self.mode = 'EDGE_FOLLOW'
         else:
             self.mode = raw
+
+        detour_modes = ('STATIC_DETOUR', 'DYNAMIC_AVOID')
+        if self._prev_mode_ctrl in detour_modes and self.mode not in detour_modes:
+            self._detour_exit_time = time.time()
+        self._prev_mode_ctrl = self.mode
 
     def cb_speed(self, msg: Float32):
         self.speed_limit = float(msg.data)
@@ -493,6 +503,24 @@ class ControllerNode(Node):
             # U-turn 模式：直接使用 PP 算出的 delta，保证最低速度以产生足够牵引
             v = max(v, 0.22)  # U-turn 最低速度 0.22 m/s（克服起步摩擦）
             delta = max(-self.delta_max, min(self.delta_max, delta))
+
+            front_d, steer_dir = self._front_obstacle_info()
+            self._log_front_d = front_d
+            if front_d < self.obs_stop_d:
+                v = 0.0
+                delta = steer_dir * self.avoid_gain
+                delta = max(-self.delta_max, min(self.delta_max, delta))
+                self.get_logger().warn(
+                    f'[U-turn] 前方障碍 {front_d:.2f}m — 紧急制动+转向',
+                    throttle_duration_sec=1.0)
+            elif front_d < self.obs_steer_d:
+                t = (front_d - self.obs_stop_d) / max(0.01, self.obs_steer_d - self.obs_stop_d)
+                v *= t
+                v = max(v, 0.1)
+                avoid_d = steer_dir * self.avoid_gain * (1.0 - t)
+                delta = delta * t + avoid_d
+                delta = max(-self.delta_max, min(self.delta_max, delta))
+
             self._log_delta = delta
             self._log_delta_deg = math.degrees(delta)
             omega = v * math.tan(delta) / self.L if abs(v) > 1e-3 else 0.0
@@ -688,6 +716,7 @@ class ControllerNode(Node):
     def _check_uturn_entry(self, rx, ry, ryaw) -> bool:
         """判断是否应该进入 U-turn 模式。
         必要条件：
+          ⓪ 当前不在避障模式，且避障退出冷却已过
           ① 前方路径在较近距离内有急弯（kappa > 0.4）
           ② 车辆距离该弯段入口足够近（沿路径距离 < 1.2m，R2 修正 2.0→1.2）
           ③ 弯段累计航向变化 ≥ 140°（区分真正的 U-turn 与 Headland 90° 圆角）
@@ -697,6 +726,13 @@ class ControllerNode(Node):
         注：R2 修正后，_check_uturn_entry 只在单段连续急弯时触发；
         Headland 90° 圆角 + 其他弯道叠加造成的 289° 假急弯不再触发 U-turn。
         """
+        if self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID', 'STOP'):
+            return False
+
+        cooldown_elapsed = time.time() - self._detour_exit_time
+        if cooldown_elapsed < self._uturn_detour_cooldown_s:
+            return False
+
         pts = self.ref
         n   = len(pts)
         idx = max(0, min(self.ref_idx_hint, n - 1))
@@ -723,10 +759,11 @@ class ControllerNode(Node):
 
         # 条件③：检查后续弯段累计航向变化
         # 从 sharp_idx 开始沿路径向前扫描，累计相邻切线夹角。
-        # R2: 只要遇到 κ<0.15 立即打断，不再跨多段弯累加。
+        # 连续 2+ 个低曲率点才认为弯段结束（防止绕行弧边界处单点抖动误触发）。
         total_turn = 0.0
         scan_dist = 0.0
         prev_heading = None
+        low_kappa_streak = 0
         for i in range(sharp_idx, min(n - 1, sharp_idx + 80)):
             hx = pts[i+1][0] - pts[i][0]
             hy = pts[i+1][1] - pts[i][1]
@@ -738,12 +775,14 @@ class ControllerNode(Node):
                 total_turn += abs(wrap(hdg - prev_heading))
             prev_heading = hdg
             scan_dist += seg
-            # 走过 8m 认为弯段结束
             if scan_dist > 8.0:
                 break
-            # R2: 只要 κ 回落（< 0.15）就立即打断，不再要求 >= 3 点
             if i > sharp_idx and abs(self._estimate_curvature(i)) < 0.15:
-                break
+                low_kappa_streak += 1
+                if low_kappa_streak >= 2:
+                    break
+            else:
+                low_kappa_streak = 0
 
         if total_turn < math.radians(140):
             # 不足 140°, 认为是 Headland 圆角或普通弯道，用 Stanley 跟踪
@@ -862,13 +901,12 @@ class ControllerNode(Node):
         best_d = float('inf')
         best_i = idx
         lo = max(0, idx - 3)
-        hi = min(n - 1, idx + 25)
+        hi = min(n - 1, idx + 6)
         for i in range(lo, hi + 1):
             d = math.hypot(rx - pts[i][0], ry - pts[i][1])
             if d < best_d:
                 best_d = d
                 best_i = i
-        # 只单调向前推进
         if best_i > self.ref_idx_hint:
             self.ref_idx_hint = best_i
 
@@ -997,7 +1035,7 @@ class ControllerNode(Node):
             self.ref_idx_hint = 0
 
         lo  = max(0, self.ref_idx_hint - 5)
-        hi  = min(n - 1, self.ref_idx_hint + 100)
+        hi  = min(n - 1, self.ref_idx_hint + 6)
         sub = pts[lo: hi + 1]
 
         best_d = float('inf')
@@ -1007,13 +1045,6 @@ class ControllerNode(Node):
             if d < best_d:
                 best_d = d
                 best_i = lo + i
-
-        if best_d > 2.0:
-            for i, (px, py, _) in enumerate(pts):
-                d = math.hypot(rx - px, ry - py)
-                if d < best_d:
-                    best_d = d
-                    best_i = i
 
         if best_i > self.ref_idx_hint:
             self.ref_idx_hint = best_i
