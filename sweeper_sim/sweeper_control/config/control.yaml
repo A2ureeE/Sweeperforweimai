@@ -16,9 +16,9 @@ controller_node:
     wall_dist_ref:        0.35
     kp_wall:              0.5
     kd_wall:              0.1
-    obstacle_slow_dist:   2.5
-    obstacle_steer_dist:  1.6
-    obstacle_stop_dist:   0.9
+    obstacle_slow_dist:   1.2
+    obstacle_steer_dist:  0.8
+    obstacle_stop_dist:   0.45
     front_scan_half_angle_deg: 40.0
     avoidance_omega_gain: 0.5
 

@@ -86,8 +86,10 @@ def generate_launch_description():
         'use_sim_time':       True,
         'gate1_x':  float(gate1.get('center', {}).get('x', 3.0)),
         'gate1_y':  float(gate1.get('center', {}).get('y', -8.0)),
+        'gate1_heading': float(gate1.get('heading', 0.0)),
         'gate2_x':  float(gate2.get('center', {}).get('x', 3.0)),
         'gate2_y':  float(gate2.get('center', {}).get('y',  2.0)),
+        'gate2_heading': float(gate2.get('heading', 0.0)),
         'coverage_goal_pct':  float(score.get('coverage_goal_pct', 80.0)),
         'edge_follow_goal_s': float(score.get('edge_follow_goal_s', 30.0)),
     }
@@ -149,7 +151,10 @@ def generate_launch_description():
     planner_node = Node(
         package='sweeper_planning', executable='planner_node',
         name='planner_node',
-        parameters=[cfg_planning, {'use_sim_time': True}],
+        parameters=[cfg_planning, map_params, gate_params, {
+            'map_config_file': cfg_map,
+            'use_sim_time': True,
+        }],
         output='screen')
 
     controller_node = Node(

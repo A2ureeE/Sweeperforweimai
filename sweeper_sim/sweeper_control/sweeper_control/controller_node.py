@@ -70,6 +70,10 @@ class ControllerNode(Node):
             ('stuck_net_thresh',         0.12),   # 窗口内净位移低于此 = stuck
             ('recovery_forward_speed',   0.35),
             ('recovery_hold_s',          2.5),
+            ('recovery_reverse_speed_ratio', 0.70),
+            ('recovery_forward_speed_ratio', 0.45),
+            ('recovery_turn_rate',       0.55),
+            ('recovery_reverse_phase_ratio', 0.70),
             # 壁面跟踪 PD（现在使用 /scan 数据）
             ('wall_dist_ref',            0.35),
             ('kp_wall',                  0.6),
@@ -78,9 +82,9 @@ class ControllerNode(Node):
             ('side_scan_angle_min_deg',  70.0),
             ('side_scan_angle_max_deg', 110.0),
             # 前方反应式避障
-            ('obstacle_slow_dist',       0.8),
-            ('obstacle_steer_dist',      0.5),
-            ('obstacle_stop_dist',       0.3),
+            ('obstacle_slow_dist',       1.2),
+            ('obstacle_steer_dist',      0.8),
+            ('obstacle_stop_dist',       0.45),
             ('front_scan_half_angle_deg', 30.0),
             ('avoidance_omega_gain',     0.5),
         ])
@@ -103,6 +107,10 @@ class ControllerNode(Node):
         self.stuck_thr  = g('stuck_net_thresh').value
         self.rec_spd    = g('recovery_forward_speed').value
         self.rec_hold   = g('recovery_hold_s').value
+        self.rec_rev_ratio = g('recovery_reverse_speed_ratio').value
+        self.rec_fwd_ratio = g('recovery_forward_speed_ratio').value
+        self.rec_turn_rate = g('recovery_turn_rate').value
+        self.rec_phase_ratio = g('recovery_reverse_phase_ratio').value
         self.wall_ref   = g('wall_dist_ref').value
         self.kp_wall    = g('kp_wall').value
         self.kd_wall    = g('kd_wall').value
@@ -159,7 +167,11 @@ class ControllerNode(Node):
 
         # 恢复状态
         self._recovering  = False
+        self._rec_start_t = 0.0
         self._rec_end_t   = 0.0
+        self._rec_turn_dir = 1.0
+        self._rec_mode = 'COVERAGE'
+        self._rec_turn_pref = 1.0
 
         # 壁面 PD 状态
         self._wall_err_prev = 0.0
@@ -246,14 +258,20 @@ class ControllerNode(Node):
             self.ref_idx_hint = 0
         else:
             # 轨迹未到但路径已收到：用最近点搜索（容错处理）
-            best_d = float('inf')
-            best_i = 0
-            for i, (px, py, _) in enumerate(self.ref):
-                d = math.hypot(rx - px, ry - py)
-                if d < best_d:
-                    best_d = d
-                    best_i = i
+            best_i, _ = self._nearest_ref_idx(rx, ry)
             self.ref_idx_hint = best_i
+
+    def _nearest_ref_idx(self, rx: float, ry: float):
+        if not self.ref:
+            return 0, float('inf')
+        best_d = float('inf')
+        best_i = 0
+        for i, (px, py, _) in enumerate(self.ref):
+            d = math.hypot(rx - px, ry - py)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, best_d
 
     def _find_nearest_entry(self):
         """延迟结束时用最近点搜索定位入点，从当前位置自然切入路径。
@@ -264,13 +282,7 @@ class ControllerNode(Node):
             self._entry_locked = True
             return
         rx, ry, _, _ = self.robot
-        best_d = float('inf')
-        best_i = 0
-        for i, (px, py, _) in enumerate(self.ref):
-            d = math.hypot(rx - px, ry - py)
-            if d < best_d:
-                best_d = d
-                best_i = i
+        best_i, best_d = self._nearest_ref_idx(rx, ry)
         self.ref_idx_hint = best_i
         self._entry_locked = True
         self.get_logger().info(f'延迟结束，入口点={best_i}，最近距离={best_d:.2f}m')
@@ -303,11 +315,57 @@ class ControllerNode(Node):
 
     def cb_recovery(self, msg):
         if msg.data == 'resume_coverage':
-            self.ref_idx_hint = self._saved_ref_idx
+            if self.robot is not None and self.ref:
+                rx, ry, _, _ = self.robot
+                self.ref_idx_hint, _ = self._nearest_ref_idx(rx, ry)
+            else:
+                self.ref_idx_hint = self._saved_ref_idx
             self._recovering = False
+            self._rec_start_t = 0.0
+            self._rec_end_t = 0.0
             self._pos_history.clear()
             self.get_logger().info(
-                f'恢复 Coverage: ref_idx_hint={self._saved_ref_idx}')
+                f'恢复 Coverage: ref_idx_hint={self.ref_idx_hint}')
+
+    def _start_recovery(self, now_s: float, steer_dir: float, front_d: float):
+        self._saved_ref_idx = self.ref_idx_hint
+        if abs(steer_dir) > 1e-3:
+            self._rec_turn_dir = math.copysign(1.0, steer_dir)
+            self._rec_turn_pref = -self._rec_turn_dir
+        else:
+            self._rec_turn_dir = self._rec_turn_pref
+            self._rec_turn_pref *= -1.0
+        self._recovering = True
+        self._rec_start_t = now_s
+        self._rec_end_t = now_s + self.rec_hold
+        self._rec_mode = self.mode
+        self.get_logger().warn(
+            f'Stuck 检测触发 — 恢复模式 mode={self.mode} '
+            f'front={front_d:.2f}m turn={"left" if self._rec_turn_dir > 0 else "right"}')
+
+    def _apply_recovery_cmd(self, now_s: float, cmd: Twist, front_d: float) -> bool:
+        if not self._recovering:
+            return False
+        if now_s >= self._rec_end_t:
+            self._recovering = False
+            self._rec_start_t = 0.0
+            self._rec_end_t = 0.0
+            self.ref_idx_hint, _ = self._nearest_ref_idx(self.robot[0], self.robot[1])
+            self._pos_history.clear()
+            return False
+
+        elapsed = now_s - self._rec_start_t
+        reverse_portion = self.rec_phase_ratio
+        if self._rec_mode == 'STATIC_DETOUR':
+            reverse_portion = max(reverse_portion, 0.85)
+
+        if elapsed < self.rec_hold * reverse_portion or front_d < self.obs_slow_d:
+            cmd.linear.x = float(-self.rec_spd * self.rec_rev_ratio)
+            cmd.angular.z = float(self._rec_turn_dir * self.rec_turn_rate)
+        else:
+            cmd.linear.x = float(self.rec_spd * self.rec_fwd_ratio)
+            cmd.angular.z = float(self._rec_turn_dir * self.rec_turn_rate * 0.45)
+        return True
 
     # ── 主控制循环 ───────────────────────────────────────────────────────
     def tick(self):
@@ -365,35 +423,17 @@ class ControllerNode(Node):
                     self.mode in ('COVERAGE', 'STATIC_DETOUR')):
                 stuck = True
 
-        # ── 恢复逻辑（前方有障碍时后退转向，无障碍时前进）──────────────
+        # ── 恢复逻辑（卡住后优先倒车脱困，再短暂前探重回轨迹）────────────
         if self._recovering:
-            if now_s < self._rec_end_t:
-                fd, sd = self._front_obstacle_info()
-                if fd < self.obs_steer_d:
-                    cmd.linear.x  = float(-self.rec_spd * 0.5)
-                    cmd.angular.z = float(sd * 0.4)
-                else:
-                    cmd.linear.x  = float(self.rec_spd)
-                    cmd.angular.z = 0.0
+            fd, _ = self._front_obstacle_info()
+            if self._apply_recovery_cmd(now_s, cmd, fd):
                 self.pub_cmd.publish(cmd)
                 return
-            else:
-                self._recovering = False
-                self.ref_idx_hint = self._saved_ref_idx  # 回到障前保存的位置
-                self._pos_history.clear()
 
         if stuck and not self._recovering:
-            self._saved_ref_idx = self.ref_idx_hint  # 进入恢复前保存当前位置
-            self.get_logger().warn('Stuck 检测触发 — 恢复模式')
-            self._recovering = True
-            self._rec_end_t  = now_s + self.rec_hold
             fd, sd = self._front_obstacle_info()
-            if fd < self.obs_steer_d:
-                cmd.linear.x  = float(-self.rec_spd * 0.5)
-                cmd.angular.z = float(sd * 0.4)
-            else:
-                cmd.linear.x  = float(self.rec_spd)
-                cmd.angular.z = 0.0
+            self._start_recovery(now_s, sd, fd)
+            self._apply_recovery_cmd(now_s, cmd, fd)
             self.pub_cmd.publish(cmd)
             return
 

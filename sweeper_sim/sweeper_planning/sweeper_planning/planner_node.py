@@ -23,6 +23,7 @@ Publishes:
   /planner/path_progress       std_msgs/Float32
 """
 import math
+import os
 import time
 import numpy as np
 import rclpy
@@ -33,6 +34,7 @@ from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, PolygonStamped, PoseArray
 from std_msgs.msg import String, Float32
 import tf_transformations as tft
+import yaml
 
 
 def yaw_from_quat(q):
@@ -47,11 +49,22 @@ class PlannerNode(Node):
     def __init__(self):
         super().__init__('planner_node')
         self.declare_parameters('', [
+            ('area_x_min',              -12.0),
+            ('area_x_max',               14.5),
+            ('area_y_min',               -9.0),
+            ('area_y_max',                9.5),
+            ('wall_filter_margin',        0.5),
+            ('map_config_file',          ''),
             ('lookahead_dist',            8.0),
             ('obstacle_inflate',           0.6),
+            ('obstacle_detour_range',      0.7),
             ('obstacle_memory_s',          8.0),
             ('gate_align_dist',            4.0),
             ('detour_shift_m',             1.0),
+            ('enable_group_detour',      False),
+            ('obstacle_group_cluster_dist', 2.0),
+            ('obstacle_group_margin_m',    0.8),
+            ('obstacle_group_min_count',   3),
             ('stagnation_time_s',          6.0),
             ('stagnation_min_dist_total',  0.5),
             # 避障回切迟滞：考虑车身长度，避免车尾尚未通过障碍就回切原路径
@@ -60,22 +73,61 @@ class PlannerNode(Node):
             # 穿门路径参数
             ('gate_approach_dist',         1.2),  # 门前等待点距门中心的距离
             ('gate_exit_dist',             2.5),  # 门后目标点距门中心的距离
+            ('gate_pose_timeout_s',        5.0),
+            ('gate_engage_dist',           6.0),
+            ('gate_pass_radius',           2.0),
+            # 仅当门位于 coverage 路径附近时，才允许在 COVERAGE 模式下强制穿门
+            ('force_gate_near_path_only',  True),
+            ('gate_path_max_dist',         1.5),
+            # 穿门候选打分：ConvergePath 权重最高
+            ('gate_converge_path_weight',  10.0),
+            ('gate_robot_dist_weight',     1.0),
+            ('gate1_x',                    float('nan')),
+            ('gate1_y',                    float('nan')),
+            ('gate1_heading',              0.0),
+            ('gate2_x',                    float('nan')),
+            ('gate2_y',                    float('nan')),
+            ('gate2_heading',              0.0),
             # 动态绕行：预测时间窗（秒）
             ('dyn_predict_s',              1.5),
+            ('vehicle_width_m',            1.05),
+            ('bridge_detour_margin_m',     0.18),
+            ('bridge_detour_max_shift_m',  1.05),
         ])
         g = self.get_parameter
+        self.area_x_min     = float(g('area_x_min').value)
+        self.area_x_max     = float(g('area_x_max').value)
+        self.area_y_min     = float(g('area_y_min').value)
+        self.area_y_max     = float(g('area_y_max').value)
+        self.wall_filter_margin = float(g('wall_filter_margin').value)
+        self.map_config_file = str(g('map_config_file').value)
         self.lookahead       = g('lookahead_dist').value
         self.inflate         = g('obstacle_inflate').value
+        self.detour_range    = g('obstacle_detour_range').value
         self.obs_mem_s       = g('obstacle_memory_s').value
         self.gate_align      = g('gate_align_dist').value
         self.detour_shift    = g('detour_shift_m').value
+        self.enable_group_detour = bool(g('enable_group_detour').value)
+        self.obs_group_cluster_dist = float(g('obstacle_group_cluster_dist').value)
+        self.obs_group_margin = float(g('obstacle_group_margin_m').value)
+        self.obs_group_min_count = int(g('obstacle_group_min_count').value)
         self.stag_time       = g('stagnation_time_s').value
         self.stag_min_d      = g('stagnation_min_dist_total').value
         self.rejoin_tail_clearance = float(g('rejoin_tail_clearance_m').value)
         self.rejoin_min_hold_s = float(g('rejoin_min_hold_s').value)
         self.gate_approach   = g('gate_approach_dist').value
         self.gate_exit       = g('gate_exit_dist').value
+        self.gate_pose_timeout_s = float(g('gate_pose_timeout_s').value)
+        self.gate_engage_dist = float(g('gate_engage_dist').value)
+        self.gate_pass_radius = float(g('gate_pass_radius').value)
+        self.force_gate_near_path_only = bool(g('force_gate_near_path_only').value)
+        self.gate_path_max_dist = float(g('gate_path_max_dist').value)
+        self.gate_converge_path_weight = float(g('gate_converge_path_weight').value)
+        self.gate_robot_dist_weight = float(g('gate_robot_dist_weight').value)
         self.dyn_predict_s   = g('dyn_predict_s').value
+        self.vehicle_width = float(g('vehicle_width_m').value)
+        self.bridge_detour_margin = float(g('bridge_detour_margin_m').value)
+        self.bridge_detour_max_shift = float(g('bridge_detour_max_shift_m').value)
 
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         # coverage/path 是 transient_local 发布；这里同样用 transient_local 订阅，
@@ -109,7 +161,14 @@ class PlannerNode(Node):
 
         # 门位姿（来自 perception）
         self.gate_pose       = None     # (cx, cy, yaw) 或 None
-        self._gate_pose_t    = 0.0      # 门位姿时间戳（过期 3s 清除）
+        self._gate_pose_t    = 0.0      # 门位姿时间戳
+        self._has_area_bounds = True
+        self.known_gates = self._build_known_gates_from_params(g)
+        self._load_map_config()
+        self._active_gate_id = None
+        self._in_gate_path = False
+        self._gate_rejoin_path: list = []
+        self._gate_rejoin_target_idx = 0
 
         # 停滞检测
         self._stag_accum_d   = 0.0
@@ -141,10 +200,28 @@ class PlannerNode(Node):
     def cb_cov(self, msg: Path):
         self.cov_pts       = [(p.pose.position.x, p.pose.position.y)
                               for p in msg.poses]
+        if (not self._has_area_bounds) and self.cov_pts:
+            xs = [p[0] for p in self.cov_pts]
+            ys = [p[1] for p in self.cov_pts]
+            self.area_x_min = min(xs) - 0.5
+            self.area_x_max = max(xs) + 0.5
+            self.area_y_min = min(ys) - 0.5
+            self.area_y_max = max(ys) + 0.5
+            self._has_area_bounds = True
+            self.get_logger().warn(
+                f'未从地图文件读取到边界，使用路径推断边界: '
+                f'x=[{self.area_x_min:.1f},{self.area_x_max:.1f}] '
+                f'y=[{self.area_y_min:.1f},{self.area_y_max:.1f}]')
         self.progress_idx  = 0
         self._stag_accum_d = 0.0
         self._stag_start_t = time.time()
         self._last_stag_pos = None
+        self._refresh_gate_path_distances()
+        # 门只需要穿过一次：不要在路径刷新时重置 passed 状态。
+        # 否则 coverage_node 重发 /coverage/path 后会再次要求穿门。
+        if self._active_gate_id is not None:
+            if all(g['id'] != self._active_gate_id or g['passed'] for g in self.known_gates):
+                self._active_gate_id = None
         # get_logger().info(f'Coverage path received: {len(self.cov_pts)} pts')
 
     def cb_odom(self, msg: Odometry):
@@ -155,6 +232,8 @@ class PlannerNode(Node):
     def cb_obs(self, msg: PolygonStamped):
         now = time.time()
         for p in msg.polygon.points:
+            if self._is_wall_point(float(p.x), float(p.y)):
+                continue
             k = (round(float(p.x), 1), round(float(p.y), 1))
             self.obs_memory[k] = now + self.obs_mem_s
         expired = [k for k, t in self.obs_memory.items() if t < now]
@@ -190,15 +269,61 @@ class PlannerNode(Node):
         rx, ry, ryaw = self.robot
         now = time.time()
 
-        # ── 门位姿过期清理（3s）──
-        if self.gate_pose and now - self._gate_pose_t > 3.0:
+        # ── 门位姿过期清理 ──
+        if self.gate_pose and now - self._gate_pose_t > self.gate_pose_timeout_s:
             self.gate_pose = None
 
-        # ── NARROW_GATE：生成穿门专用路径 ────────────────────────────
-        if self.mode == 'NARROW_GATE' and self.gate_pose is not None:
-            path = self._build_gate_path(rx, ry, ryaw)
+        self._update_gate_state(rx, ry)
+        gate_target = self._select_gate_target(rx, ry)
+        if gate_target is not None:
+            gcx, gcy, gyaw, src = gate_target
+            path = self._build_gate_path(rx, ry, (gcx, gcy, gyaw), src)
             if path:
+                self._in_gate_path = True
                 self._publish_path(path)
+                return
+        if self._in_gate_path:
+            self._in_gate_path = False
+            self._detour_clear_pending = False
+            self._detour_start_idx = None
+            self._returning_from_detour = False
+            self._stag_accum_d = 0.0
+            self._stag_start_t = now
+            self._last_stag_pos = None
+            if self.cov_pts:
+                n_cov = len(self.cov_pts)
+                rejoin_idx = self._find_nearest_cov_idx(
+                    rx, ry, span_back=n_cov, span_fwd=n_cov)
+                safe_rejoin_idx = self._advance_to_safe_rejoin_idx(
+                    rejoin_idx,
+                    clear_threshold=self.rejoin_tail_clearance,
+                    search_ahead=80,
+                    min_advance=12,
+                )
+                if safe_rejoin_idx != rejoin_idx:
+                    self.get_logger().info(
+                        f'穿门回归前推: idx {rejoin_idx}→{safe_rejoin_idx} '
+                        f'(clear>={self.rejoin_tail_clearance:.2f}m)')
+                rejoin_idx = safe_rejoin_idx
+                self.progress_idx = rejoin_idx
+                self._gate_rejoin_target_idx = rejoin_idx
+                bridge = self._build_rejoin_bridge(rx, ry, ryaw, rejoin_idx)
+                self._gate_rejoin_path = bridge
+                self.get_logger().info(
+                    f'穿门结束，生成回归路径 bridge={len(bridge)}pts → '
+                    f'cov idx={rejoin_idx}')
+
+        if self._gate_rejoin_path:
+            d_to_target = 999.0
+            if self.cov_pts and self._gate_rejoin_target_idx < len(self.cov_pts):
+                tx, ty = self.cov_pts[self._gate_rejoin_target_idx]
+                d_to_target = math.hypot(rx - tx, ry - ty)
+            if d_to_target < 1.5:
+                self._gate_rejoin_path = []
+                self.get_logger().info(
+                    f'回归路径跟踪完成, dist={d_to_target:.2f}m')
+            else:
+                self._publish_path(self._gate_rejoin_path)
                 return
 
         if not self.cov_pts:
@@ -219,6 +344,8 @@ class PlannerNode(Node):
             self._detour_clear_pending = False
             self.get_logger().info(
                 f'进入避障模式，保存路径位置 idx={self.progress_idx}')
+        if self.mode in detour_modes:
+            self._detour_start_idx = self.progress_idx
 
         if leaving_detour and self._detour_start_idx is not None:
             # 进入“待清障”阶段：不要立刻回切原路径，要等车尾也越过障碍。
@@ -230,15 +357,29 @@ class PlannerNode(Node):
 
         # 尾部清障判定：只有满足“时间 + 距离”双条件才发送 cleared。
         if self._detour_clear_pending:
+            self._detour_start_idx = self.progress_idx
             min_obs_d = self._nearest_obstacle_distance(rx, ry)
             hold_s = now - self._detour_exit_t
             if hold_s >= self.rejoin_min_hold_s and min_obs_d >= self.rejoin_tail_clearance:
+                rejoin_idx = self._find_nearest_cov_idx(rx, ry, span_back=30, span_fwd=120)
+                safe_rejoin_idx = self._advance_to_safe_rejoin_idx(
+                    rejoin_idx,
+                    clear_threshold=self.rejoin_tail_clearance,
+                    search_ahead=60,
+                    min_advance=6,
+                )
+                if safe_rejoin_idx != rejoin_idx:
+                    self.get_logger().info(
+                        f'避障回切前推: idx {rejoin_idx}→{safe_rejoin_idx} '
+                        f'(clear>={self.rejoin_tail_clearance:.2f}m)')
+                rejoin_idx = safe_rejoin_idx
                 self.get_logger().info(
                     f'避障回切放行: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m '
-                    f'>= {self.rejoin_tail_clearance:.2f}m')
+                    f'>= {self.rejoin_tail_clearance:.2f}m, rejoin_idx={rejoin_idx}')
                 self._detour_clear_pending = False
-                self._detour_start_idx = None
-                self._returning_from_detour = False
+                self.progress_idx = rejoin_idx
+                self._detour_start_idx = rejoin_idx
+                self._returning_from_detour = True
                 # 通知 behavior_node 和 controller：避障结束，可以恢复路径跟踪
                 self.pub_detour_end.publish(String(data='cleared'))
             else:
@@ -436,8 +577,28 @@ class PlannerNode(Node):
 
         # ── 静态障碍物侧向推开 ──────────────────────────────────────
         if self.mode in ('COVERAGE', 'STATIC_DETOUR'):
+            used_structured_detour = False
+            if self.enable_group_detour:
+                group_detour = self._plan_obstacle_group_detour(slice_pts)
+                if group_detour is not None:
+                    slice_pts, group_n, group_shift = group_detour
+                    used_structured_detour = True
+                    self.get_logger().info(
+                        f'[GROUP_DETOUR] obstacles={group_n} shift={group_shift:.2f}m '
+                        f'progress_idx={self.progress_idx}',
+                        throttle_duration_sec=0.5)
             pre_detour = slice_pts[:]
-            slice_pts = self._apply_detour(slice_pts)
+            bridge_detour = self._plan_bridge_detour(slice_pts, rx, ry, ryaw)
+            if bridge_detour is not None:
+                slice_pts, hit_obs, hit_clear, min_clear = bridge_detour
+                used_structured_detour = True
+                self.get_logger().info(
+                    f'[BRIDGE_DETOUR] obstacle=({hit_obs[0]:.1f},{hit_obs[1]:.1f}) '
+                    f'nearest={hit_clear:.2f}m min_clear={min_clear:.2f}m '
+                    f'progress_idx={self.progress_idx}',
+                    throttle_duration_sec=0.5)
+            if not used_structured_detour:
+                slice_pts = self._apply_detour(slice_pts)
             max_shift = 0.0
             for i in range(len(slice_pts)):
                 sh = math.hypot(slice_pts[i][0] - pre_detour[i][0],
@@ -476,36 +637,37 @@ class PlannerNode(Node):
             f'路径进度={self.progress_idx}/{n} ({pct:.1f}%) | '
             f'静态障碍记忆={len(self.obs_memory)}个 '
             f'动态障碍={len(self.dyn_obstacles)}个 | '
-            f'窄门={"检测到" if self.gate_pose else "无"} | '
+            f'窄门={"检测到" if self.gate_pose else "无"} '
+            f'剩余门={len([g for g in self.known_gates if not g["passed"]])} | '
             f'停滞累积={self._stag_accum_d:.2f}m | '
             f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}° '
             f'到prog点={d_to_prog:.1f}m')
 
     # ── 穿门路径生成 ─────────────────────────────────────────────────────
-    def _build_gate_path(self, rx, ry, ryaw) -> list:
+    def _build_gate_path_points(self, rx, ry, gate_pose):
         """
-        生成 5 点穿门路径：
-          当前位置 → 门前等待点 → 门中心 → 门后出口点 → 更远目标
-        以门的进入方向（ryaw）为基准生成直线路径。
+        生成 5 点穿门路径（不记录日志），用于候选评估与碰撞检查。
         """
-        gcx, gcy, g_yaw = self.gate_pose
-
-        # 用机器人当前朝向作为进门方向（更实用）
-        cos_y = math.cos(ryaw)
-        sin_y = math.sin(ryaw)
+        gcx, gcy, gate_yaw = gate_pose
+        gate_to_robot = math.atan2(gcy - ry, gcx - rx)
+        if abs(wrap(gate_yaw - gate_to_robot)) > math.pi * 0.5:
+            gate_yaw = wrap(gate_yaw + math.pi)
+        cos_y = math.cos(gate_yaw)
+        sin_y = math.sin(gate_yaw)
 
         # 5个路径点
         approach_d = self.gate_approach
         exit_d     = self.gate_exit
+        pre_x = gcx - cos_y * approach_d
+        pre_y = gcy - sin_y * approach_d
+        post_x = gcx + cos_y * exit_d
+        post_y = gcy + sin_y * exit_d
         pts = [
             (rx, ry),                                         # 0: 当前位置
-            (gcx - cos_y * approach_d * 0.5,
-             gcy - sin_y * approach_d * 0.5),                # 1: 门前半程
+            ((rx + pre_x) * 0.5, (ry + pre_y) * 0.5),        # 1: 门前引导
             (gcx, gcy),                                       # 2: 门中心
-            (gcx + cos_y * exit_d * 0.5,
-             gcy + sin_y * exit_d * 0.5),                    # 3: 门后半程
-            (gcx + cos_y * exit_d,
-             gcy + sin_y * exit_d),                          # 4: 完全穿越
+            ((gcx + post_x) * 0.5, (gcy + post_y) * 0.5),    # 3: 门后半程
+            (post_x, post_y),                                # 4: 完全穿越
         ]
         # 检查路径有效性（避免退行）
         for i in range(len(pts) - 1):
@@ -513,10 +675,178 @@ class PlannerNode(Node):
             dy = pts[i+1][1] - pts[i][1]
             if math.hypot(dx, dy) < 0.05:
                 return None
+        return pts, gate_yaw
+
+    def _build_gate_path(self, rx, ry, gate_pose, source: str = 'perception') -> list:
+        """
+        生成 5 点穿门路径：
+          当前位置 → 门前等待点 → 门中心 → 门后出口点 → 更远目标
+        以门朝向为基准，强制穿过门中心。
+        """
+        out = self._build_gate_path_points(rx, ry, gate_pose)
+        if out is None:
+            return None
+        pts, gate_yaw = out
+        gcx, gcy, _ = gate_pose
         self.get_logger().info(
-            f'穿门路径: 门中心({gcx:.1f},{gcy:.1f}), 进门方向={math.degrees(ryaw):.0f}°',
+            f'穿门路径[{source}]: 门中心({gcx:.1f},{gcy:.1f}), 门朝向={math.degrees(gate_yaw):.0f}°',
             throttle_duration_sec=1.0)
         return pts
+
+    def _update_gate_state(self, rx: float, ry: float):
+        for gate in self.known_gates:
+            if gate['passed']:
+                continue
+            if math.hypot(rx - gate['x'], ry - gate['y']) <= self.gate_pass_radius:
+                gate['passed'] = True
+                if self._active_gate_id == gate['id']:
+                    self._active_gate_id = None
+                self.get_logger().info(f'Gate {gate["id"]} 已穿过')
+
+    def _distance_to_path_range(self, px: float, py: float, start_idx: int, end_idx: int) -> float:
+        if len(self.cov_pts) < 2:
+            return float('inf')
+        start_idx = max(0, start_idx)
+        end_idx = min(len(self.cov_pts) - 1, end_idx)
+        if end_idx - start_idx < 1:
+            return float('inf')
+        best = float('inf')
+        for i in range(start_idx, end_idx):
+            ax, ay = self.cov_pts[i]
+            bx, by = self.cov_pts[i + 1]
+            vx = bx - ax
+            vy = by - ay
+            seg2 = vx * vx + vy * vy
+            if seg2 <= 1e-9:
+                qx, qy = ax, ay
+            else:
+                t = ((px - ax) * vx + (py - ay) * vy) / seg2
+                t = max(0.0, min(1.0, t))
+                qx = ax + t * vx
+                qy = ay + t * vy
+            d = math.hypot(px - qx, py - qy)
+            if d < best:
+                best = d
+        return best
+
+    def _distance_to_cov_path(self, px: float, py: float) -> float:
+        return self._distance_to_path_range(px, py, 0, len(self.cov_pts) - 1)
+
+    def _distance_to_converge_path(self, px: float, py: float) -> float:
+        if not self.cov_pts:
+            return float('inf')
+        n = len(self.cov_pts)
+        # ConvergePath: 以当前 progress 为中心的局部跟踪段，而非全局 coverage。
+        lo = max(0, self.progress_idx - 30)
+        hi = min(n - 1, self.progress_idx + 140)
+        return self._distance_to_path_range(px, py, lo, hi)
+
+    def _refresh_gate_path_distances(self):
+        if not self.known_gates:
+            return
+        for gate in self.known_gates:
+            gate['path_dist'] = self._distance_to_cov_path(gate['x'], gate['y'])
+            if math.isfinite(gate['path_dist']):
+                self.get_logger().info(
+                    f'Gate {gate["id"]} 到 coverage 路径最近距离: '
+                    f'{gate["path_dist"]:.2f}m')
+
+    def _is_gate_path_collision_free(self, rx: float, ry: float, gate_pose) -> bool:
+        out = self._build_gate_path_points(rx, ry, gate_pose)
+        if out is None:
+            return False
+        pts, _ = out
+        if not self.obs_memory and not self.dyn_obstacles:
+            return True
+
+        static_safe = max(0.7, self.inflate + 0.5 * self.vehicle_width)
+        dynamic_safe = static_safe + 0.3
+        samples = []
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            seg = math.hypot(bx - ax, by - ay)
+            n = max(2, int(seg / 0.25) + 1)
+            for k in range(n):
+                t = k / (n - 1)
+                sx = ax + (bx - ax) * t
+                sy = ay + (by - ay) * t
+                # 近似未来时刻，用于动态障碍预测
+                p = (i + t) / max(1.0, float(len(pts) - 1))
+                samples.append((sx, sy, p * self.dyn_predict_s))
+
+        for sx, sy, pred_t in samples:
+            for ox, oy in self.obs_memory.keys():
+                if math.hypot(sx - ox, sy - oy) < static_safe:
+                    return False
+            for wx, wy, vx, vy, _ in self.dyn_obstacles:
+                px = wx + vx * pred_t
+                py = wy + vy * pred_t
+                if math.hypot(sx - px, sy - py) < dynamic_safe:
+                    return False
+        return True
+
+    def _select_gate_target(self, rx: float, ry: float):
+        # 优先级：
+        # 1) ConvergePath（门必须贴近 coverage path，且权重最高）
+        # 2) 触发避障模式时禁止穿门，优先避障
+        # 3) 门路径必须通过碰撞检查
+        if self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID', 'STOP'):
+            return None
+
+        pending_gates = [g for g in self.known_gates if not g['passed']]
+        gate_candidates = []
+        for gate in pending_gates:
+            robot_dist = math.hypot(rx - gate['x'], ry - gate['y'])
+            if robot_dist > self.gate_engage_dist:
+                continue
+            path_dist = self._distance_to_converge_path(gate['x'], gate['y'])
+            global_path_dist = gate.get('path_dist', float('inf'))
+            if self.force_gate_near_path_only and path_dist > self.gate_path_max_dist:
+                self.get_logger().info(
+                    f'跳过强制穿门: gate={gate["id"]} '
+                    f'距ConvergePath{path_dist:.2f}m (全局{global_path_dist:.2f}m) '
+                    f'> 阈值{self.gate_path_max_dist:.2f}m',
+                    throttle_duration_sec=2.0)
+                continue
+            if not self._is_gate_path_collision_free(
+                    rx, ry, (gate['x'], gate['y'], gate['yaw'])):
+                self.get_logger().info(
+                    f'跳过强制穿门: gate={gate["id"]} 路径碰撞风险',
+                    throttle_duration_sec=2.0)
+                continue
+            # ConvergePath 权重最高：优先选择更贴近 coverage path 的门
+            score = (self.gate_converge_path_weight * path_dist
+                     + self.gate_robot_dist_weight * robot_dist)
+            gate_candidates.append((score, gate, robot_dist, path_dist))
+
+        best_gate = None
+        if gate_candidates:
+            gate_candidates.sort(key=lambda x: x[0])
+            best_gate = gate_candidates[0][1]
+
+        if self.mode == 'NARROW_GATE':
+            if self.gate_pose is not None:
+                pgx, pgy, pyaw = self.gate_pose
+                p_path_dist = self._distance_to_converge_path(pgx, pgy)
+                if (not self.force_gate_near_path_only
+                        or p_path_dist <= self.gate_path_max_dist):
+                    if self._is_gate_path_collision_free(rx, ry, (pgx, pgy, pyaw)):
+                        return (pgx, pgy, pyaw, 'perception')
+            if best_gate is not None:
+                self._active_gate_id = best_gate['id']
+                return (best_gate['x'], best_gate['y'], best_gate['yaw'], 'map_fallback')
+            return None
+
+        if best_gate is not None:
+            self._active_gate_id = best_gate['id']
+            self.get_logger().info(
+                f'强制穿门: gate={best_gate["id"]} dist='
+                f'{math.hypot(rx - best_gate["x"], ry - best_gate["y"]):.2f}m',
+                throttle_duration_sec=1.0)
+            return (best_gate['x'], best_gate['y'], best_gate['yaw'], 'map_forced')
+
+        return None
 
     # ── 动态障碍物横向偏移 ──────────────────────────────────────────────
     def _apply_dynamic_detour(self, pts: list, rx, ry, ryaw) -> list:
@@ -571,21 +901,307 @@ class PlannerNode(Node):
         return shifted
 
     # ── 静态障碍物排斥偏移 ──────────────────────────────────────────────
+    def _is_wall_point(self, wx: float, wy: float) -> bool:
+        if not self._has_area_bounds:
+            return False
+        m = self.wall_filter_margin
+        return (
+            abs(wx - self.area_x_min) <= m or
+            abs(wx - self.area_x_max) <= m or
+            abs(wy - self.area_y_min) <= m or
+            abs(wy - self.area_y_max) <= m
+        )
+
+    @staticmethod
+    def _to_float(v, default=float('nan')):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _build_known_gates_from_params(self, get_param):
+        out = []
+        x1 = self._to_float(get_param('gate1_x').value)
+        y1 = self._to_float(get_param('gate1_y').value)
+        h1 = self._to_float(get_param('gate1_heading').value, 0.0)
+        if math.isfinite(x1) and math.isfinite(y1):
+            out.append({'id': 1, 'x': x1, 'y': y1, 'yaw': h1, 'passed': False})
+        x2 = self._to_float(get_param('gate2_x').value)
+        y2 = self._to_float(get_param('gate2_y').value)
+        h2 = self._to_float(get_param('gate2_heading').value, 0.0)
+        if math.isfinite(x2) and math.isfinite(y2):
+            out.append({'id': 2, 'x': x2, 'y': y2, 'yaw': h2, 'passed': False})
+        return out
+
+    def _load_map_config(self):
+        if not self.map_config_file:
+            self._has_area_bounds = all(math.isfinite(v) for v in (
+                self.area_x_min, self.area_x_max, self.area_y_min, self.area_y_max))
+            return
+        if not os.path.isfile(self.map_config_file):
+            self.get_logger().warn(f'map_config_file 不存在: {self.map_config_file}')
+            return
+        try:
+            with open(self.map_config_file, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.get_logger().warn(f'读取地图配置失败: {e}')
+            return
+
+        m = data.get('map', {})
+        area = m.get('area', {})
+        ax_min = self._to_float(area.get('x_min'), self.area_x_min)
+        ax_max = self._to_float(area.get('x_max'), self.area_x_max)
+        ay_min = self._to_float(area.get('y_min'), self.area_y_min)
+        ay_max = self._to_float(area.get('y_max'), self.area_y_max)
+        if all(math.isfinite(v) for v in (ax_min, ax_max, ay_min, ay_max)):
+            self.area_x_min, self.area_x_max = ax_min, ax_max
+            self.area_y_min, self.area_y_max = ay_min, ay_max
+            self._has_area_bounds = True
+
+        gates = m.get('gates', [])
+        parsed_gates = []
+        for idx, gate in enumerate(gates, start=1):
+            center = gate.get('center', {})
+            gx = self._to_float(center.get('x'))
+            gy = self._to_float(center.get('y'))
+            gh = self._to_float(gate.get('heading'), 0.0)
+            gid = int(gate.get('id', idx))
+            if math.isfinite(gx) and math.isfinite(gy):
+                parsed_gates.append({
+                    'id': gid, 'x': gx, 'y': gy, 'yaw': gh,
+                    'passed': False, 'path_dist': float('inf')
+                })
+        if parsed_gates:
+            self.known_gates = parsed_gates
+        self.get_logger().info(
+            f'地图配置已加载: bounds=({self.area_x_min:.1f},{self.area_x_max:.1f},'
+            f'{self.area_y_min:.1f},{self.area_y_max:.1f}) gates={len(self.known_gates)}')
+
+    def _plan_obstacle_group_detour(self, pts: list):
+        if len(pts) < 6 or len(self.obs_memory) < self.obs_group_min_count:
+            return None
+
+        near_obs = []
+        near_thresh = self.detour_range + 0.6
+        for ox, oy in self.obs_memory.keys():
+            best = min(math.hypot(px - ox, py - oy) for px, py in pts)
+            if best < near_thresh:
+                near_obs.append((ox, oy))
+
+        if len(near_obs) < self.obs_group_min_count:
+            return None
+
+        clusters = []
+        remaining = set(range(len(near_obs)))
+        while remaining:
+            seed = remaining.pop()
+            queue = [seed]
+            cluster = [seed]
+            while queue:
+                i = queue.pop()
+                ix, iy = near_obs[i]
+                to_add = []
+                for j in remaining:
+                    jx, jy = near_obs[j]
+                    if math.hypot(ix - jx, iy - jy) <= self.obs_group_cluster_dist:
+                        to_add.append(j)
+                for j in to_add:
+                    remaining.remove(j)
+                    queue.append(j)
+                    cluster.append(j)
+            clusters.append(cluster)
+
+        cluster_idx = max(clusters, key=len)
+        if len(cluster_idx) < self.obs_group_min_count:
+            return None
+        cluster = [near_obs[i] for i in cluster_idx]
+
+        cx = sum(p[0] for p in cluster) / len(cluster)
+        cy = sum(p[1] for p in cluster) / len(cluster)
+        group_r = max(math.hypot(ox - cx, oy - cy) for ox, oy in cluster) + self.obs_group_margin
+
+        hit_idx = [i for i, (px, py) in enumerate(pts)
+                   if math.hypot(px - cx, py - cy) <= group_r + self.detour_range * 0.5]
+        if len(hit_idx) < 2:
+            return None
+
+        start_i = max(1, min(hit_idx) - 1)
+        end_i = min(len(pts) - 2, max(hit_idx) + 1)
+        if end_i - start_i < 2:
+            return None
+
+        ax, ay = pts[start_i - 1]
+        bx, by = pts[end_i + 1]
+        tx = bx - ax
+        ty = by - ay
+        tnorm = math.hypot(tx, ty)
+        if tnorm < 1e-4:
+            return None
+        tx /= tnorm
+        ty /= tnorm
+        nx = -ty
+        ny = tx
+
+        mid_i = (start_i + end_i) // 2
+        mx, my = pts[mid_i]
+        detour_amp = max(self.detour_shift * 1.2, group_r)
+        detour_amp = min(
+            detour_amp,
+            max(self.detour_shift, self.bridge_detour_max_shift),
+        )
+        plus_d = math.hypot(mx + nx * detour_amp - cx, my + ny * detour_amp - cy)
+        minus_d = math.hypot(mx - nx * detour_amp - cx, my - ny * detour_amp - cy)
+        sign = 1.0 if plus_d >= minus_d else -1.0
+
+        out = pts[:]
+        span = max(1, end_i - start_i)
+        for i in range(start_i, end_i + 1):
+            t = float(i - start_i) / float(span)
+            profile = math.sin(math.pi * t)
+            offset = detour_amp * profile * sign
+            out[i] = (pts[i][0] + nx * offset, pts[i][1] + ny * offset)
+        return out, len(cluster), detour_amp
+
+    @staticmethod
+    def _robot_frame(wx: float, wy: float, rx: float, ry: float, ryaw: float):
+        dx = wx - rx
+        dy = wy - ry
+        return (
+            dx * math.cos(ryaw) + dy * math.sin(ryaw),
+            -dx * math.sin(ryaw) + dy * math.cos(ryaw),
+        )
+
+    def _segment_min_clearance(self, pts: list, start_i: int, end_i: int) -> float:
+        if not self.obs_memory:
+            return 999.0
+        best = 999.0
+        obstacles = list(self.obs_memory.keys())
+        for i in range(start_i, end_i + 1):
+            px, py = pts[i]
+            for ox, oy in obstacles:
+                d = math.hypot(px - ox, py - oy)
+                if d < best:
+                    best = d
+        return best
+
+    def _plan_bridge_detour(self, pts: list, rx: float, ry: float, ryaw: float):
+        """围绕正前方阻塞物生成平滑桥接路径，替代简单点级排斥。"""
+        if len(pts) < 6 or not self.obs_memory:
+            return None
+
+        candidate_thresh = max(self.inflate + 0.25, self.detour_range + 0.10)
+        candidates = []
+        for ox, oy in self.obs_memory.keys():
+            lx, ly = self._robot_frame(ox, oy, rx, ry, ryaw)
+            if lx < -0.4 or abs(ly) > 3.5:
+                continue
+            best_i = 0
+            best_d = float('inf')
+            for i, (px, py) in enumerate(pts):
+                d = math.hypot(px - ox, py - oy)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_d <= candidate_thresh:
+                candidates.append((best_i, best_d, ox, oy))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        hit_i, hit_d, ox, oy = candidates[0]
+        start_i = max(1, hit_i - 4)
+        end_i = min(len(pts) - 2, hit_i + 8)
+        if end_i - start_i < 3:
+            return None
+
+        ax, ay = pts[start_i - 1]
+        bx, by = pts[end_i + 1]
+        tx = bx - ax
+        ty = by - ay
+        tnorm = math.hypot(tx, ty)
+        if tnorm < 1e-4:
+            return None
+        tx /= tnorm
+        ty /= tnorm
+        nx = -ty
+        ny = tx
+
+        px, py = pts[hit_i]
+        lateral_err = (ox - px) * nx + (oy - py) * ny
+        min_safe_clear = max(
+            self.inflate + 0.10,
+            self.vehicle_width * 0.5 + self.bridge_detour_margin,
+        )
+        desired_clear = max(min_safe_clear + 0.20, self.detour_shift * 1.05)
+        detour_amp = max(desired_clear, abs(lateral_err) + min_safe_clear + 0.18)
+        detour_amp = min(
+            detour_amp,
+            max(min_safe_clear + 0.12, self.bridge_detour_max_shift),
+        )
+
+        current_clear = self._segment_min_clearance(pts, start_i, end_i)
+        best_choice = None
+        best_score = -float('inf')
+
+        for sign in (1.0, -1.0):
+            out = pts[:]
+            span = float(max(1, end_i - start_i))
+            for i in range(start_i, end_i + 1):
+                t = float(i - start_i) / span
+                profile = math.sin(math.pi * t)
+                offset = sign * detour_amp * profile
+                out[i] = (pts[i][0] + nx * offset, pts[i][1] + ny * offset)
+
+            min_clear = self._segment_min_clearance(out, start_i, end_i)
+            hit_clear = min(
+                math.hypot(out[i][0] - ox, out[i][1] - oy)
+                for i in range(start_i, end_i + 1)
+            )
+            away_bonus = -sign * math.copysign(1.0, lateral_err) if abs(lateral_err) > 1e-3 else 0.0
+            score = min_clear + 0.35 * hit_clear + 0.15 * away_bonus
+            if score > best_score:
+                best_score = score
+                best_choice = (out, hit_clear, min_clear)
+
+        if best_choice is None:
+            return None
+
+        out, hit_clear, min_clear = best_choice
+        if min_clear < min_safe_clear or hit_clear < min_safe_clear:
+            self.get_logger().warn(
+                f'[BRIDGE_DETOUR_REJECT] obstacle=({ox:.1f},{oy:.1f}) '
+                f'min_clear={min_clear:.2f}m hit_clear={hit_clear:.2f}m '
+                f'< safe={min_safe_clear:.2f}m',
+                throttle_duration_sec=0.5)
+            return None
+        if min_clear < current_clear + 0.05 and hit_clear < desired_clear:
+            return None
+        return out, (ox, oy), hit_clear, min_clear
+
     def _apply_detour(self, pts: list) -> list:
         if not self.obs_memory:
             return pts
         obstacles = list(self.obs_memory.keys())
         out = []
+        effective_range = max(self.inflate + 0.1, self.detour_range)
+        max_shift = max(self.detour_shift, self.bridge_detour_max_shift)
         for x, y in pts:
             sx, sy = 0.0, 0.0
             for ox, oy in obstacles:
                 dist = math.hypot(x - ox, y - oy)
-                if dist < self.inflate + 0.1 and dist > 1e-4:
-                    rep = (self.inflate + 0.1 - dist) / (self.inflate + 0.1)
+                if dist < effective_range and dist > 1e-4:
+                    rep = (effective_range - dist) / effective_range
                     nx  = (x - ox) / dist
                     ny  = (y - oy) / dist
                     sx += rep * nx * self.detour_shift
                     sy += rep * ny * self.detour_shift
+            shift_norm = math.hypot(sx, sy)
+            if shift_norm > max_shift and shift_norm > 1e-6:
+                scale = max_shift / shift_norm
+                sx *= scale
+                sy *= scale
             out.append((x + sx, y + sy))
         return out
 
@@ -601,6 +1217,73 @@ class PlannerNode(Node):
             if d < best:
                 best = d
         return best
+
+    def _find_nearest_cov_idx(self, rx: float, ry: float, span_back: int = 20, span_fwd: int = 80) -> int:
+        if not self.cov_pts:
+            return self.progress_idx
+        n = len(self.cov_pts)
+        lo = max(0, self.progress_idx - max(1, span_back))
+        hi = min(n - 1, self.progress_idx + max(1, span_fwd))
+        best_i = self.progress_idx
+        best_d = float('inf')
+        for i in range(lo, hi + 1):
+            px, py = self.cov_pts[i]
+            d = math.hypot(rx - px, ry - py)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    def _advance_to_safe_rejoin_idx(self, start_idx: int,
+                                    clear_threshold: float,
+                                    search_ahead: int = 60,
+                                    min_advance: int = 0) -> int:
+        if not self.cov_pts or not self.obs_memory:
+            if not self.cov_pts:
+                return start_idx
+            n = len(self.cov_pts)
+            return max(0, min(start_idx + max(0, min_advance), n - 1))
+        n = len(self.cov_pts)
+        start_idx = max(0, min(start_idx, n - 1))
+        start_scan_idx = min(n - 1, start_idx + max(0, min_advance))
+        best_idx = start_scan_idx
+        best_clear = -1.0
+        for idx in range(start_scan_idx, min(n, start_idx + max(1, search_ahead) + 1)):
+            end_idx = min(n - 1, idx + 10)
+            seg_clear = self._segment_min_clearance(self.cov_pts, idx, end_idx)
+            if seg_clear > best_clear:
+                best_clear = seg_clear
+                best_idx = idx
+            if seg_clear >= clear_threshold:
+                return idx
+        return best_idx
+
+    def _build_rejoin_bridge(self, rx: float, ry: float, ryaw: float,
+                              target_idx: int) -> list:
+        """从当前位置生成平滑路径回到 coverage path 上的 target_idx 点。
+
+        路径结构: 当前位置 → 中间插值点 → 目标点 → 目标后延续几个 coverage 点
+        这样 controller 可以平滑过渡而不突然跳转。
+        """
+        if not self.cov_pts or target_idx >= len(self.cov_pts):
+            return [(rx, ry)]
+        tx, ty = self.cov_pts[target_idx]
+        dist = math.hypot(rx - tx, ry - ty)
+        pts = [(rx, ry)]
+        if dist > 1.0:
+            steps = max(2, int(dist / 0.5))
+            for i in range(1, steps + 1):
+                t = i / float(steps)
+                pts.append((rx + (tx - rx) * t, ry + (ty - ry) * t))
+        else:
+            pts.append((tx, ty))
+        n = len(self.cov_pts)
+        tail_count = min(20, n - target_idx - 1)
+        for i in range(1, tail_count + 1):
+            ci = target_idx + i
+            if ci < n:
+                pts.append(self.cov_pts[ci])
+        return pts
 
     # ── 发布路径 ─────────────────────────────────────────────────────────
     def _publish_path(self, pts: list):

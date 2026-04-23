@@ -19,6 +19,7 @@ import csv
 import json
 import math
 import os
+from pathlib import Path
 import time
 import rclpy
 from rclpy.node import Node
@@ -29,8 +30,6 @@ from geometry_msgs.msg import PolygonStamped, PoseArray
 from std_msgs.msg import String, Float32
 import tf_transformations as tft
 
-
-LOG_BASE = os.path.expanduser('~/.ros/sweeper_logs')
 
 # 评分维度权重（供摘要计算）
 SCORE_WEIGHTS = {
@@ -46,13 +45,43 @@ def yaw_from_quat(q):
     return tft.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
 
 
+def resolve_log_base_dir() -> str:
+    """优先使用可写目录，避免 ~/.ros 在受限环境下报权限错误。"""
+    candidates = []
+
+    env_base = os.environ.get('SWEEPER_LOG_BASE')
+    if env_base:
+        candidates.append(Path(env_base).expanduser())
+
+    ros_log_dir = os.environ.get('ROS_LOG_DIR')
+    if ros_log_dir:
+        candidates.append(Path(ros_log_dir).expanduser() / 'sweeper_logs')
+
+    candidates.append(Path('~/.ros/sweeper_logs').expanduser())
+    candidates.append(Path.cwd() / 'log' / 'sweeper_logs')
+    candidates.append(Path('/tmp/sweeper_logs'))
+
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            test_file = base / '.write_test'
+            test_file.write_text('ok', encoding='utf-8')
+            test_file.unlink()
+            return str(base)
+        except OSError:
+            continue
+
+    raise RuntimeError('No writable log directory available for score_logger_node')
+
+
 class ScoreLoggerNode(Node):
     def __init__(self):
         super().__init__('score_logger_node')
 
         # ── 创建本次运行的日志目录 ──────────────────────────────────────
         ts = int(time.time())
-        self.run_dir = os.path.join(LOG_BASE, f'run_{ts}')
+        self.log_base_dir = resolve_log_base_dir()
+        self.run_dir = os.path.join(self.log_base_dir, f'run_{ts}')
         os.makedirs(self.run_dir, exist_ok=True)
 
         self.traj_path    = os.path.join(self.run_dir, 'trajectory.csv')

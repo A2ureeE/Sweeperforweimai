@@ -53,8 +53,8 @@ class BehaviorNode(Node):
             ('area_y_max',              9.5),
             ('wall_filter_margin',      0.5),
             ('emergency_brake_dist',  0.35),
-            ('dynamic_avoid_dist',    1.8),
-            ('static_detour_dist',    1.2),
+            ('dynamic_avoid_dist',    2.5),
+            ('static_detour_dist',    1.8),
             ('narrow_gate_dist',      3.0),
             ('edge_follow_dist',      0.55),
             ('enable_edge_follow',    False),
@@ -63,6 +63,10 @@ class BehaviorNode(Node):
             ('normal_speed',          0.8),
             ('narrow_gate_speed',     0.4),
             ('detour_speed',          0.5),
+            ('close_obstacle_speed',  0.3),
+            ('slowdown_far_dist',     2.5),
+            ('slowdown_mid_dist',     1.5),
+            ('slowdown_near_dist',    0.8),
             # Gate hysteresis: require N consecutive 'approaching' frames
             ('gate_hysteresis_frames', 3),
         ])
@@ -83,6 +87,10 @@ class BehaviorNode(Node):
         self.normal_speed    = g('normal_speed').value
         self.gate_speed      = g('narrow_gate_speed').value
         self.detour_speed    = g('detour_speed').value
+        self.close_obs_speed = g('close_obstacle_speed').value
+        self.slow_far_dist   = g('slowdown_far_dist').value
+        self.slow_mid_dist   = g('slowdown_mid_dist').value
+        self.slow_near_dist  = g('slowdown_near_dist').value
         self.gate_hyst       = g('gate_hysteresis_frames').value
 
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -220,9 +228,30 @@ class BehaviorNode(Node):
         rx, ry = self._robot_pos
         best = 999.0
         for wx, wy in self.obstacles_world:
+            if self._is_wall_point(wx, wy):
+                continue
             d = math.hypot(wx - rx, wy - ry)
             if d < best:
                 best = d
+        return best
+
+    def _nearest_static_front_dist(self) -> float:
+        """仅统计机器人前方走廊内的静态障碍，避免侧后方障碍卡死避障状态。"""
+        if not self.obstacles_world:
+            return 999.0
+        rx, ry = self._robot_pos
+        best = 999.0
+        for wx, wy in self.obstacles_world:
+            if self._is_wall_point(wx, wy):
+                continue
+            lx, ly, dist = world_to_robot(wx, wy, rx, ry, self.robot_yaw)
+            if lx < -0.2:
+                continue
+            lateral_limit = 0.9 + 0.25 * max(0.0, lx)
+            if abs(ly) > lateral_limit:
+                continue
+            if dist < best:
+                best = dist
         return best
 
     def _nearest_dynamic_dist(self) -> float:
@@ -236,6 +265,35 @@ class BehaviorNode(Node):
             if d < best:
                 best = d
         return best
+
+    def _nearest_dynamic_front_dist(self) -> float:
+        """仅统计机器人前方走廊内的动态障碍，避免车侧目标持续霸占避障模式。"""
+        if not self.dyn_obstacles_world:
+            return 999.0
+        rx, ry = self._robot_pos
+        best = 999.0
+        for wx, wy, *_ in self.dyn_obstacles_world:
+            lx, ly, dist = world_to_robot(wx, wy, rx, ry, self.robot_yaw)
+            if lx < -0.3:
+                continue
+            lateral_limit = 1.1 + 0.3 * max(0.0, lx)
+            if abs(ly) > lateral_limit:
+                continue
+            if dist < best:
+                best = dist
+        return best
+
+    def _progressive_obstacle_speed(self, nearest_d: float) -> float:
+        """障碍物距离越近，速度上限越低。"""
+        if nearest_d >= self.slow_far_dist:
+            return self.normal_speed
+        if nearest_d >= self.slow_mid_dist:
+            span = max(1e-3, self.slow_far_dist - self.slow_mid_dist)
+            t = (nearest_d - self.slow_mid_dist) / span
+            return self.detour_speed + (self.normal_speed - self.detour_speed) * t
+        if nearest_d >= self.slow_near_dist:
+            return self.detour_speed
+        return self.close_obs_speed
 
     def _near_wall(self) -> bool:
         """
@@ -290,7 +348,10 @@ class BehaviorNode(Node):
 
         # ② 动态障碍物回避（正确使用世界坐标→距离）
         dyn_d = self._nearest_dynamic_dist()
-        if dyn_d < self.dyn_dist:
+        dyn_front_d = self._nearest_dynamic_front_dist()
+        static_d = self._nearest_static_dist()
+        static_front_d = self._nearest_static_front_dist()
+        if dyn_front_d < self.dyn_dist:
             mode      = 'DYNAMIC_AVOID'
             speed_lim = self.detour_speed
 
@@ -301,8 +362,7 @@ class BehaviorNode(Node):
 
         # ④ 静态障碍物绕行（正确使用世界坐标→距离）
         if mode == 'COVERAGE':
-            static_d = self._nearest_static_dist()
-            if static_d < self.static_dist:
+            if static_front_d < self.static_dist:
                 mode      = 'STATIC_DETOUR'
                 speed_lim = self.detour_speed
 
@@ -336,6 +396,10 @@ class BehaviorNode(Node):
                 t = ramp_elapsed / self._post_detour_ramp_s
                 speed_lim = self.detour_speed + (self.normal_speed - self.detour_speed) * t
 
+        # ⑦ 障碍物检测后的渐进减速（动态/静态/前向感知取最小距离）
+        nearest_obs = min(front_dist, static_front_d, dyn_front_d)
+        speed_lim = min(speed_lim, self._progressive_obstacle_speed(nearest_obs))
+
         self._publish(mode, speed_lim)
 
     def _publish(self, mode: str, speed: float):
@@ -348,12 +412,15 @@ class BehaviorNode(Node):
     def _log_status(self):
         front_d  = self._front_clear_dist()
         static_d = self._nearest_static_dist()
+        static_front_d = self._nearest_static_front_dist()
         dyn_d    = self._nearest_dynamic_dist()
+        dyn_front_d = self._nearest_dynamic_front_dist()
         near_w   = self._near_wall()
         rx, ry   = self._robot_pos
         self.get_logger().info(
             f'[行为] 模式={self._last_mode} 限速={self._last_speed:.2f} | '
-            f'前方={front_d:.2f}m 最近静态={static_d:.2f}m 最近动态={dyn_d:.2f}m | '
+            f'前方={front_d:.2f}m 静态(前/全)={static_front_d:.2f}/{static_d:.2f}m '
+            f'动态(前/全)={dyn_front_d:.2f}/{dyn_d:.2f}m | '
             f'靠墙={"是" if near_w else "否"} '
             f'贴边开关={"开" if self.enable_edge_follow else "关"} '
             f'窄门={"激活" if self._gate_active else "未激活"} | '

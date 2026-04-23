@@ -24,10 +24,28 @@ coverage_node:
 
 planner_node:
   ros__parameters:
+    area_x_min:            -12.0
+    area_x_max:             14.5
+    area_y_min:             -9.0
+    area_y_max:              9.5
+    wall_filter_margin:      0.5
     lookahead_dist:        40.0
     obstacle_inflate:      0.6
+    obstacle_detour_range: 0.7
     obstacle_memory_s:     8.0
     gate_align_dist:       4.0
-    detour_shift_m:        1.0
+    detour_shift_m:        0.8
+    bridge_detour_max_shift_m: 1.05
+    enable_group_detour:   false
+    obstacle_group_cluster_dist: 2.0
+    obstacle_group_margin_m: 0.8
+    obstacle_group_min_count: 3
     stagnation_time_s:     6.0
     stagnation_min_dist_total:   0.15
+    gate_pose_timeout_s:   5.0
+    gate_engage_dist:      6.0
+    gate_pass_radius:      2.0
+    force_gate_near_path_only: true
+    gate_path_max_dist:    1.5
+    gate_converge_path_weight: 10.0
+    gate_robot_dist_weight: 1.0

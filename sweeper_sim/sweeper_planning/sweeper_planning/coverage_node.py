@@ -820,6 +820,9 @@ class CoverageNode(Node):
 
         if cr > 0.1:
             # 圆角版本：直线段 + 1/4 圆弧
+            # 注意：_arc_pts 已排除弧起点（[1:]），包含弧终点。
+            # 因此弧后的直线段必须跳过与弧终点重合的起始值，
+            # 否则产生零长度段 → 曲率退化 → 弯道检测失效 → 撞墙。
             # 底边：SW角(xmin+cr,ymin) → SE角(xmax-cr,ymin)
             for x in np.arange(xmin + cr, xmax - cr, step):
                 pts.append((float(x), float(ymin)))
@@ -828,14 +831,14 @@ class CoverageNode(Node):
             pts.extend(_arc_pts(xmax - cr, ymin + cr, cr,
                                 -math.pi / 2, 0.0, 12))
             # 右边：SE角(xmax,ymin+cr) → NE角(xmax,ymax-cr)
-            for y in np.arange(ymin + cr, ymax - cr, step):
+            for y in np.arange(ymin + cr + step, ymax - cr, step):
                 pts.append((float(xmax), float(y)))
             pts.append((float(xmax), float(ymax - cr)))
             # NE 1/4 弧：从(xmax,ymax-cr)到(xmax-cr,ymax)，圆心(xmax-cr,ymax-cr)
             pts.extend(_arc_pts(xmax - cr, ymax - cr, cr,
                                 0.0, math.pi / 2, 12))
             # 顶边：NE→NW
-            for x in np.arange(xmax - cr, xmin + cr, -step):
+            for x in np.arange(xmax - cr - step, xmin + cr, -step):
                 pts.append((float(x), float(ymax)))
             pts.append((float(xmin + cr), float(ymax)))
             # NW 1/4 弧
@@ -843,7 +846,7 @@ class CoverageNode(Node):
                                 math.pi / 2, math.pi, 12))
             # 左边：NW → SW
             early_exit_done = False
-            for y in np.arange(ymax - cr, ymin + cr, -step):
+            for y in np.arange(ymax - cr - step, ymin + cr, -step):
                 pts.append((float(xmin), float(y)))
                 if early_exit_y is not None and y <= early_exit_y:
                     early_exit_done = True
