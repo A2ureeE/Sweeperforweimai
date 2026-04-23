@@ -23,7 +23,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Path, Odometry
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PolygonStamped, PoseArray
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float32MultiArray
 import tf_transformations as tft
 
 
@@ -115,6 +115,11 @@ class BehaviorNode(Node):
             Path, '/coverage/path', self.cb_ref, latch_qos)
         self._path_ready = False
 
+        latch_bounds_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.sub_detected_bounds = self.create_subscription(
+            Float32MultiArray, '/coverage/detected_bounds',
+            self.cb_detected_bounds, latch_bounds_qos)
+
         # 订阅 planner 的避障结束事件
         self.sub_detour_end = self.create_subscription(
             String, '/planner/detour_cleared', self.cb_detour_cleared, 5)
@@ -190,6 +195,23 @@ class BehaviorNode(Node):
 
     def cb_ref(self, msg):
         self._path_ready = True
+
+    def cb_detected_bounds(self, msg):
+        if len(msg.data) < 4:
+            return
+        new_xmin, new_xmax, new_ymin, new_ymax = msg.data[:4]
+        old = (self.area_x_min, self.area_x_max,
+               self.area_y_min, self.area_y_max)
+        new = (new_xmin, new_xmax, new_ymin, new_ymax)
+        if old != new:
+            self.area_x_min = new_xmin
+            self.area_x_max = new_xmax
+            self.area_y_min = new_ymin
+            self.area_y_max = new_ymax
+            self.get_logger().info(
+                f'[AUTO-DETECT] 更新边界: '
+                f'x=[{new_xmin:.1f},{new_xmax:.1f}] '
+                f'y=[{new_ymin:.1f},{new_ymax:.1f}]')
 
     def cb_detour_cleared(self, msg):
         if msg.data == 'cleared':

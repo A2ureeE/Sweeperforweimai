@@ -1,0 +1,183 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="test_small">
+
+    <!-- Physics -->
+    <physics type="ode">
+      <real_time_update_rate>1000</real_time_update_rate>
+      <max_step_size>0.002</max_step_size>
+      <real_time_factor>0.0</real_time_factor>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>50</iters>
+          <sor>1.3</sor>
+        </solver>
+      </ode>
+    </physics>
+
+    <!-- Sun light -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>40 30</size></plane></geometry>
+          <surface><friction><ode><mu>1</mu><mu2>1</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>40 30</size></plane></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grass</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ===================== BOUNDARY WALLS ===================== -->
+    <!-- Area: x=-8~8, y=-6~6  (16m x 12m, about 40% of original) -->
+    <!-- Wall height=1.2m (above laser at z=0.975m), thickness=0.1m -->
+
+    <!-- South wall (y=-6) -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0.0 -6.05 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>16.1 0.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>16.1 0.1 1.2</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- North wall (y=6) -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0.0 6.05 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>16.1 0.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>16.1 0.1 1.2</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- West wall (x=-8) -->
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-8.05 0.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.1 12.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.1 12.1 1.2</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- East wall (x=8) -->
+    <model name="wall_east">
+      <static>true</static>
+      <pose>8.05 0.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.1 12.1 1.2</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.1 12.1 1.2</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ===================== STATIC OBSTACLES (random cones) ===================== -->
+    <!-- 7 cones scattered across the 16x12m area -->
+
+    <model name="cone_1"><static>true</static><pose>-5.0 2.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_2"><static>true</static><pose>-1.5 -3.5 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_3"><static>true</static><pose>2.5 4.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_4"><static>true</static><pose>5.5 -2.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_5"><static>true</static><pose>0.0 1.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_6"><static>true</static><pose>-3.5 -1.5 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <model name="cone_7"><static>true</static><pose>6.0 3.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.4 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ===================== NARROW GATE (x=3, y=-4) ===================== -->
+    <!-- Gate width = 2.0m -->
+    <model name="gate1_L"><static>true</static><pose>3.0 -3.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="gate1_R"><static>true</static><pose>3.0 -5.0 0.6 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry></collision>
+        <visual name="vis"><geometry><cylinder><radius>0.12</radius><length>1.2</length></cylinder></geometry>
+          <material><ambient>1.0 0.8 0.0 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ===================== DYNAMIC PEDESTRIAN ===================== -->
+    <model name="pedestrian">
+      <pose>-1.0 1.0 0.9 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>70.0</mass><inertia><ixx>5</ixx><iyy>5</iyy><izz>2</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <collision name="col">
+          <geometry><cylinder><radius>0.3</radius><length>1.8</length></cylinder></geometry>
+        </collision>
+        <visual name="vis">
+          <geometry><cylinder><radius>0.3</radius><length>1.8</length></cylinder></geometry>
+          <material><ambient>0.2 0.4 0.8 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

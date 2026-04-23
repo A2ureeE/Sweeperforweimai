@@ -1,0 +1,35 @@
+map:
+  world_file: test_small.world
+  spawn:
+    x: -6.0
+    y: -4.0
+    z: 0.1
+    yaw: 0.0
+  area:
+    x_min: -8.0
+    x_max: 8.0
+    y_min: -6.0
+    y_max: 6.0
+  edge:
+    follow_offset: 0.2
+    sweep_offset: 0.8
+  sweep:
+    row_spacing: 1.95
+    min_turn_radius: 1.95
+  gates:
+  - id: 1
+    center:
+      x: 3.0
+      y: -4.0
+    heading: 0.0
+    width: 2.0
+  known_obstacles: []
+  dynamic_zone:
+    center:
+      x: -1.0
+      y: 1.0
+    radius: 4.0
+  scoring:
+    coverage_goal_pct: 80.0
+    edge_follow_goal_s: 30.0
+    gate_pass_timeout_s: 120.0

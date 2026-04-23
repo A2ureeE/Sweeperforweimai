@@ -87,10 +87,18 @@ def generate_launch_description():
         ],
         output='screen')
 
+    map_cfg_area = map_cfg.get('area', {})
+    mover_params = {
+        'use_sim_time': True,
+        'area_x_min': float(map_cfg_area.get('x_min', -12.0)),
+        'area_x_max': float(map_cfg_area.get('x_max',  14.5)),
+        'area_y_min': float(map_cfg_area.get('y_min',  -9.0)),
+        'area_y_max': float(map_cfg_area.get('y_max',   9.5)),
+    }
     mover = Node(
         package='sweeper_gazebo', executable='moving_obstacle_node',
         name='moving_obstacle_node', output='screen',
-        parameters=[{'use_sim_time': True}])
+        parameters=[mover_params])
 
     return LaunchDescription([
         world_arg, x_arg, y_arg, yaw_arg, gui_arg,

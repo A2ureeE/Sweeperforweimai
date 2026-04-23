@@ -33,7 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, PolygonStamped, PoseArray
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 import tf_transformations as tft
 import yaml
@@ -178,6 +178,12 @@ class PlannerNode(Node):
             String,          '/behavior/mode',                  self.cb_mode,      5)
         self.sub_recovery_status = self.create_subscription(
             String,          '/controller/recovery_status',     self.cb_recovery_status, 5)
+        self.sub_detected_bounds = self.create_subscription(
+            Float32MultiArray, '/coverage/detected_bounds',     self.cb_detected_bounds,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.sub_detected_gates = self.create_subscription(
+            PoseArray,       '/coverage/detected_gates',        self.cb_detected_gates,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self.pub_ref   = self.create_publisher(Path,    '/reference_path',        5)
         self.pub_prog  = self.create_publisher(Float32, '/planner/path_progress', 5)
@@ -366,6 +372,45 @@ class PlannerNode(Node):
         elif msg.data == 'recovery_done':
             self._controller_recovering = False
 
+    def cb_detected_bounds(self, msg: Float32MultiArray):
+        if len(msg.data) < 4:
+            return
+        new_xmin, new_xmax, new_ymin, new_ymax = msg.data[:4]
+        old = (self.area_x_min, self.area_x_max,
+               self.area_y_min, self.area_y_max)
+        new = (new_xmin, new_xmax, new_ymin, new_ymax)
+        if old != new:
+            self.area_x_min = new_xmin
+            self.area_x_max = new_xmax
+            self.area_y_min = new_ymin
+            self.area_y_max = new_ymax
+            self._has_area_bounds = True
+            self.get_logger().info(
+                f'[AUTO-DETECT] 从 coverage 接收到新边界: '
+                f'x=[{new_xmin:.1f},{new_xmax:.1f}] '
+                f'y=[{new_ymin:.1f},{new_ymax:.1f}]')
+
+    def cb_detected_gates(self, msg: PoseArray):
+        if not msg.poses:
+            return
+        new_gates = []
+        for i, pose in enumerate(msg.poses):
+            gx = pose.position.x
+            gy = pose.position.y
+            yaw = yaw_from_quat(pose.orientation)
+            gid = i + 1
+            already_passed = any(
+                g['id'] == gid and g['passed'] for g in self.known_gates)
+            new_gates.append({
+                'id': gid, 'x': gx, 'y': gy, 'yaw': yaw,
+                'passed': already_passed, 'path_dist': float('inf')
+            })
+        if new_gates:
+            self.known_gates = new_gates
+            self._refresh_gate_path_distances()
+            self.get_logger().info(
+                f'[AUTO-DETECT] 从 coverage 接收到 {len(new_gates)} 个门位置')
+
     # ── 主循环 ──────────────────────────────────────────────────────────
     def tick(self):
         if self.robot is None:
@@ -514,9 +559,16 @@ class PlannerNode(Node):
 
         self._prev_mode = self.mode
 
-        # ── R4: 启动 warmup，前 N 秒强制 progress_idx=0 ─────────────────
+        # ── R4: 启动 warmup，默认前 N 秒强制 progress_idx=0 ──────────────
+        # 但当机器人已经开始运动，或行为层已进入避障/停车模式时，提前退出 warmup，
+        # 避免 warmup 期间出现障碍仍被“钉死在 idx=0”。
         warmup_elapsed = now - self._t_start
-        in_warmup = warmup_elapsed < self._warmup_sec
+        warmup_time_active = warmup_elapsed < self._warmup_sec
+        warmup_blocked_by_mode = self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID', 'STOP')
+        warmup_robot_moving = self._robot_speed >= 0.03
+        in_warmup = (warmup_time_active
+                     and not warmup_blocked_by_mode
+                     and not warmup_robot_moving)
         if in_warmup:
             self.progress_idx = 0
             self._stag_accum_d = 0.0
@@ -527,6 +579,12 @@ class PlannerNode(Node):
                     f'pos=({rx:.1f},{ry:.1f}), 路径前 3 点='
                     f'{[(round(float(pts[i][0]),2), round(float(pts[i][1]),2)) for i in range(min(3, n))]}')
                 self._warmup_log_done = True
+        elif warmup_time_active:
+            self.get_logger().info(
+                f'[R4 warmup-exit] t={warmup_elapsed:.1f}s '
+                f'mode={self.mode} speed={self._robot_speed:.2f}m/s '
+                f'→ 提前解除 progress_idx 锁定',
+                throttle_duration_sec=1.0)
 
         # ── 前向滑动窗口推进 ────────────────────────────────────────────
         # 当车辆几乎静止（脱困/碰撞恢复期间）时冻结 progress_idx，

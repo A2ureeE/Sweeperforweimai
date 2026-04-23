@@ -12,14 +12,15 @@ Publishes:
   /planner/progress       std_msgs/Float32        (2 Hz, 0-1)
 """
 import math
+import re
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float32
+from geometry_msgs.msg import PoseStamped, PoseArray
+from std_msgs.msg import Float32, Float32MultiArray
 import tf_transformations as tft
 
 # Gazebo ModelStates 用于在线障碍感知（R5）。当 gazebo_msgs 不可用时退化处理。
@@ -112,6 +113,8 @@ class CoverageNode(Node):
             # R5: 障碍感知
             ('obstacle_clearance',    0.83),    # body_hw + 0.3 安全余量
             ('obstacle_model_ignore', 'z200,ground_plane,sun,wall,sweep_course'),
+            # 自动检测：从 Gazebo model_states 中读取墙壁和门位置
+            ('auto_detect_bounds',    True),
         ])
         g = self.get_parameter
         self.xmin       = g('area_x_min').value
@@ -134,9 +137,13 @@ class CoverageNode(Node):
         self.headland_off = g('headland_edge_offset').value
         self.obs_clearance = float(g('obstacle_clearance').value)
         self.obs_ignore_words = [w.strip() for w in str(g('obstacle_model_ignore').value).split(',') if w.strip()]
+        self._auto_detect_bounds = bool(g('auto_detect_bounds').value)
         # 在线障碍快照（R5）：(x, y, r)
         self._obstacles_snapshot: list = []
         self._obstacles_got = False
+        # 自动检测状态
+        self._bounds_detected = False
+        self._detected_gates: list = []
 
         # Grid dimensions
         self.W = max(1, int(math.ceil((self.xmax - self.xmin) / self.res)))
@@ -152,6 +159,10 @@ class CoverageNode(Node):
         self.pub_grid  = self.create_publisher(OccupancyGrid, '/coverage/grid', 5)
         self.pub_cov   = self.create_publisher(Float32, '/coverage/coverage_pct', 5)
         self.pub_prog  = self.create_publisher(Float32, '/planner/progress', 5)
+        self.pub_bounds = self.create_publisher(
+            Float32MultiArray, '/coverage/detected_bounds', latch)
+        self.pub_detected_gates = self.create_publisher(
+            PoseArray, '/coverage/detected_gates', latch)
         self.sub_odom  = self.create_subscription(
             Odometry, '/odom', self.cb_odom, sensor_qos)
 
@@ -180,13 +191,17 @@ class CoverageNode(Node):
         self._rebuild_timer = self.create_timer(2.0, self._rebuild_with_obstacles)
 
     def cb_model_states(self, msg):
-        """收集静态障碍物（名字不在忽略列表里的模型）。"""
+        """收集静态障碍物，并自动检测墙壁边界和门位置。"""
+        if self._auto_detect_bounds and not self._bounds_detected:
+            self._try_detect_bounds(msg)
+        if self._auto_detect_bounds and not self._detected_gates:
+            self._try_detect_gates(msg)
+
         obs = []
         for name, pose in zip(msg.name, msg.pose):
             low = name.lower()
             if any(w.lower() in low for w in self.obs_ignore_words):
                 continue
-            # 半径估计：名字含 gate/cone/cylinder 取 0.12，否则取 0.3
             if any(k in low for k in ('gate', 'cone', 'cylinder', 'pillar')):
                 r = 0.12
             else:
@@ -195,8 +210,120 @@ class CoverageNode(Node):
         self._obstacles_snapshot = obs
         self._obstacles_got = True
 
+    def _try_detect_bounds(self, msg):
+        """从 model_states 中的 wall_* 模型推断场地边界。"""
+        walls = {}
+        for name, pose in zip(msg.name, msg.pose):
+            low = name.lower()
+            if 'wall' not in low:
+                continue
+            x = float(pose.position.x)
+            y = float(pose.position.y)
+            if 'south' in low:
+                walls['south'] = y + 0.05
+            elif 'north' in low:
+                walls['north'] = y - 0.05
+            elif 'west' in low:
+                walls['west'] = x + 0.05
+            elif 'east' in low:
+                walls['east'] = x - 0.05
+
+        if len(walls) < 4:
+            return
+
+        new_xmin = walls['west']
+        new_xmax = walls['east']
+        new_ymin = walls['south']
+        new_ymax = walls['north']
+        old = (self.xmin, self.xmax, self.ymin, self.ymax)
+        new = (new_xmin, new_xmax, new_ymin, new_ymax)
+
+        self._bounds_detected = True
+        if old == new:
+            self.get_logger().info(
+                f'[AUTO-DETECT] 墙壁边界与参数一致: '
+                f'x=[{new_xmin:.1f},{new_xmax:.1f}] '
+                f'y=[{new_ymin:.1f},{new_ymax:.1f}]')
+            return
+
+        self.xmin, self.xmax = new_xmin, new_xmax
+        self.ymin, self.ymax = new_ymin, new_ymax
+        self.W = max(1, int(math.ceil((self.xmax - self.xmin) / self.res)))
+        self.H = max(1, int(math.ceil((self.ymax - self.ymin) / self.res)))
+        self._swept = np.zeros((self.H, self.W), dtype=bool)
+        self._total_cells = self.W * self.H
+        self.get_logger().info(
+            f'[AUTO-DETECT] 从墙壁推断场地边界: '
+            f'x=[{self.xmin:.1f},{self.xmax:.1f}] '
+            f'y=[{self.ymin:.1f},{self.ymax:.1f}] '
+            f'(原始参数值: x=[{old[0]:.1f},{old[1]:.1f}] '
+            f'y=[{old[2]:.1f},{old[3]:.1f}])')
+
+        bounds_msg = Float32MultiArray()
+        bounds_msg.data = [float(self.xmin), float(self.xmax),
+                           float(self.ymin), float(self.ymax)]
+        self.pub_bounds.publish(bounds_msg)
+
+    def _try_detect_gates(self, msg):
+        """从 model_states 中的 gate*_L / gate*_R 模型对推断门位置。"""
+        gate_sides: dict = {}
+        for name, pose in zip(msg.name, msg.pose):
+            low = name.lower()
+            m = re.match(r'gate(\d+)_(l|r)', low)
+            if not m:
+                continue
+            gid = int(m.group(1))
+            side = m.group(2)
+            if gid not in gate_sides:
+                gate_sides[gid] = {}
+            gate_sides[gid][side] = (float(pose.position.x),
+                                     float(pose.position.y))
+
+        if not gate_sides:
+            return
+
+        gates = []
+        for gid in sorted(gate_sides.keys()):
+            sides = gate_sides[gid]
+            if 'l' not in sides or 'r' not in sides:
+                continue
+            lx, ly = sides['l']
+            rx, ry = sides['r']
+            cx = (lx + rx) / 2.0
+            cy = (ly + ry) / 2.0
+            dx = lx - rx
+            dy = ly - ry
+            heading = math.atan2(dy, dx) + math.pi / 2.0
+            heading = wrap(heading)
+            width = math.hypot(dx, dy)
+            gates.append({'id': gid, 'x': cx, 'y': cy,
+                          'heading': heading, 'width': width})
+            self.get_logger().info(
+                f'[AUTO-DETECT] 门 {gid}: '
+                f'中心=({cx:.2f},{cy:.2f}) '
+                f'朝向={math.degrees(heading):.0f}° '
+                f'宽度={width:.2f}m')
+
+        self._detected_gates = gates
+        if gates:
+            pa = PoseArray()
+            pa.header.stamp = self.get_clock().now().to_msg()
+            pa.header.frame_id = self.frame
+            for g in gates:
+                ps = PoseStamped()
+                ps.pose.position.x = g['x']
+                ps.pose.position.y = g['y']
+                ps.pose.position.z = g['width']
+                q = tft.quaternion_from_euler(0, 0, g['heading'])
+                ps.pose.orientation.x = q[0]
+                ps.pose.orientation.y = q[1]
+                ps.pose.orientation.z = q[2]
+                ps.pose.orientation.w = q[3]
+                pa.poses.append(ps.pose)
+            self.pub_detected_gates.publish(pa)
+
     def _rebuild_with_obstacles(self):
-        """在订阅 /model_states 2 秒后用障碍快照重建路径。"""
+        """在订阅 /model_states 2 秒后用障碍快照和自动检测的边界重建路径。"""
         if self._rebuild_done:
             return
         self._rebuild_done = True
@@ -204,14 +331,23 @@ class CoverageNode(Node):
             self._rebuild_timer.cancel()
         except Exception:
             pass
+        need_rebuild = False
+        if self._bounds_detected:
+            self.get_logger().info(
+                f'[AUTO-DETECT] 使用检测到的边界重建路径: '
+                f'x=[{self.xmin:.1f},{self.xmax:.1f}] '
+                f'y=[{self.ymin:.1f},{self.ymax:.1f}]')
+            need_rebuild = True
         if self._obstacles_got and self._obstacles_snapshot:
             self.get_logger().info(
                 f'[R5] 重建路径：已收集 {len(self._obstacles_snapshot)} 个障碍物 '
                 f'{[(round(x,2), round(y,2), round(r,2)) for x,y,r in self._obstacles_snapshot[:8]]}'
             )
+            need_rebuild = True
+        if need_rebuild:
             self._build_and_publish()
         else:
-            self.get_logger().info('[R5] 无障碍快照（或订阅未收到），沿用初始路径')
+            self.get_logger().info('[R5] 无障碍快照且未检测到边界变化，沿用初始路径')
 
     def _republish_path_once(self):
         # 原实现 self._xxx = lambda: None 无效，因为 timer 已绑定原方法引用；
