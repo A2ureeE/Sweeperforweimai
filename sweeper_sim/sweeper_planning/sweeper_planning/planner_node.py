@@ -34,6 +34,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, PolygonStamped, PoseArray
 from std_msgs.msg import String, Float32
+from visualization_msgs.msg import Marker, MarkerArray
 import tf_transformations as tft
 import yaml
 
@@ -71,6 +72,7 @@ class PlannerNode(Node):
             ('obstacle_memory_s',          8.0),
             ('gate_align_dist',            4.0),
             ('detour_shift_m',             1.0),
+            ('detour_max_shift_ratio_of_width', 0.5),
             ('enable_group_detour',      False),
             ('obstacle_group_cluster_dist', 2.0),
             ('obstacle_group_margin_m',    0.8),
@@ -92,6 +94,10 @@ class PlannerNode(Node):
             # 穿门候选打分：ConvergePath 权重最高
             ('gate_converge_path_weight',  10.0),
             ('gate_robot_dist_weight',     1.0),
+            ('gate_converge_back_idx',     10),
+            ('gate_converge_ahead_idx',   120),
+            ('gate_arc_min_dist',         1.0),
+            ('gate_arc_max_dist',        25.0),
             ('gate1_x',                    float('nan')),
             ('gate1_y',                    float('nan')),
             ('gate1_heading',              0.0),
@@ -103,6 +109,10 @@ class PlannerNode(Node):
             ('vehicle_width_m',            1.05),
             ('bridge_detour_margin_m',     0.18),
             ('bridge_detour_max_shift_m',  1.05),
+            # 避障收敛开关：仅保留平滑桥接，关闭整段平移和点级排斥
+            ('enable_dynamic_shift_detour',      False),
+            ('enable_point_repulsion_fallback',  False),
+            ('detour_latch_once_per_episode',    True),
         ])
         g = self.get_parameter
         self.area_x_min     = float(g('area_x_min').value)
@@ -117,6 +127,7 @@ class PlannerNode(Node):
         self.obs_mem_s       = g('obstacle_memory_s').value
         self.gate_align      = g('gate_align_dist').value
         self.detour_shift    = g('detour_shift_m').value
+        self.detour_max_shift_ratio = float(g('detour_max_shift_ratio_of_width').value)
         self.enable_group_detour = bool(g('enable_group_detour').value)
         self.obs_group_cluster_dist = float(g('obstacle_group_cluster_dist').value)
         self.obs_group_margin = float(g('obstacle_group_margin_m').value)
@@ -134,10 +145,20 @@ class PlannerNode(Node):
         self.gate_path_max_dist = float(g('gate_path_max_dist').value)
         self.gate_converge_path_weight = float(g('gate_converge_path_weight').value)
         self.gate_robot_dist_weight = float(g('gate_robot_dist_weight').value)
+        self.gate_converge_back_idx = max(1, int(g('gate_converge_back_idx').value))
+        self.gate_converge_ahead_idx = max(20, int(g('gate_converge_ahead_idx').value))
+        self.gate_arc_min_dist = max(0.0, float(g('gate_arc_min_dist').value))
+        self.gate_arc_max_dist = max(self.gate_arc_min_dist + 1.0,
+                                     float(g('gate_arc_max_dist').value))
         self.dyn_predict_s   = g('dyn_predict_s').value
         self.vehicle_width = float(g('vehicle_width_m').value)
         self.bridge_detour_margin = float(g('bridge_detour_margin_m').value)
         self.bridge_detour_max_shift = float(g('bridge_detour_max_shift_m').value)
+        # 把绕行上限绑定到车身宽度比例，避免 GUI 上出现过远绕行。
+        self.detour_shift_cap = max(0.2, self.vehicle_width * self.detour_max_shift_ratio)
+        self.enable_dynamic_shift = bool(g('enable_dynamic_shift_detour').value)
+        self.enable_repulsion_fallback = bool(g('enable_point_repulsion_fallback').value)
+        self.detour_latch_once = bool(g('detour_latch_once_per_episode').value)
 
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         # coverage/path 是 transient_local 发布；这里同样用 transient_local 订阅，
@@ -162,6 +183,7 @@ class PlannerNode(Node):
         self.pub_prog  = self.create_publisher(Float32, '/planner/path_progress', 5)
         self.pub_detour_end = self.create_publisher(String, '/planner/detour_cleared', 5)
         self.pub_rejoin_ready = self.create_publisher(String, '/planner/rejoin_ready', 5)
+        self.pub_gate_markers = self.create_publisher(MarkerArray, '/planner/gate_markers', 1)
 
         self.cov_pts: list   = []
         self.robot           = None       # (x, y, yaw)
@@ -201,6 +223,10 @@ class PlannerNode(Node):
         self._last_bridge_obs: tuple  = (0.0, 0.0)
         self._last_bridge_result: list | None = None
         self._bridge_hold_ticks: int  = 0
+
+        # 单次避障锁存：一次 detour episode 仅生成一条平滑路径并复用
+        self._latched_detour_path: list | None = None
+        self._latched_detour_meta: dict | None = None
 
         # Unified planner state machine
         self._planner_state = PlannerState.NORMAL
@@ -391,6 +417,7 @@ class PlannerNode(Node):
             self.gate_pose = None
 
         self._update_gate_state(rx, ry)
+        self._publish_gate_markers()
         gate_target = self._select_gate_target(rx, ry)
         if gate_target is not None:
             gcx, gcy, gyaw, src = gate_target
@@ -671,67 +698,40 @@ class PlannerNode(Node):
             self.get_logger().info('路径遍历完成，从头循环覆盖...')
             return
 
-        # ── 静态障碍物侧向推开 ──────────────────────────────────────
-        if self.mode in ('COVERAGE', 'STATIC_DETOUR'):
-            used_structured_detour = False
-            if self.enable_group_detour:
-                group_detour = self._plan_obstacle_group_detour(slice_pts)
-                if group_detour is not None:
-                    slice_pts, group_n, group_shift = group_detour
-                    used_structured_detour = True
+        # ── 平滑避障（仅 bridge detour，单次锁存） ─────────────────
+        if self.mode in ('COVERAGE', 'STATIC_DETOUR', 'DYNAMIC_AVOID'):
+            if self.detour_latch_once and self._latched_detour_path is not None:
+                if len(self._latched_detour_path) >= 2:
+                    slice_pts = self._latched_detour_path
                     self.get_logger().info(
-                        f'[GROUP_DETOUR] obstacles={group_n} shift={group_shift:.2f}m '
-                        f'progress_idx={self.progress_idx}',
-                        throttle_duration_sec=0.5)
-            pre_detour = slice_pts[:]
-            bridge_detour = self._plan_bridge_detour(slice_pts, rx, ry, ryaw)
-            if bridge_detour is not None:
-                slice_pts, hit_obs, hit_clear, min_clear = bridge_detour
-                used_structured_detour = True
-                self._last_bridge_result = slice_pts[:]
-                self._bridge_hold_ticks = 5
-                self.get_logger().info(
-                    f'[BRIDGE_DETOUR] obstacle=({hit_obs[0]:.1f},{hit_obs[1]:.1f}) '
-                    f'nearest={hit_clear:.2f}m min_clear={min_clear:.2f}m '
-                    f'progress_idx={self.progress_idx}',
-                    throttle_duration_sec=0.5)
-            elif self._bridge_hold_ticks > 0 and self._last_bridge_result is not None:
-                # Bridge rejected this tick but was active recently — hold
-                # previous result to prevent bridge/repulsion oscillation.
-                self._bridge_hold_ticks -= 1
-                if len(self._last_bridge_result) == len(slice_pts):
-                    alpha = 0.5 + 0.5 * (self._bridge_hold_ticks / 5.0)
-                    blended = []
-                    for i in range(len(slice_pts)):
-                        bx = alpha * self._last_bridge_result[i][0] + (1.0 - alpha) * slice_pts[i][0]
-                        by = alpha * self._last_bridge_result[i][1] + (1.0 - alpha) * slice_pts[i][1]
-                        blended.append((bx, by))
-                    slice_pts = blended
-                    used_structured_detour = True
-                if self._bridge_hold_ticks <= 0:
-                    self._last_bridge_result = None
-            else:
-                self._bridge_hold_ticks = 0
-                self._last_bridge_result = None
-            if not used_structured_detour:
-                slice_pts = self._apply_detour(slice_pts)
-            max_shift = 0.0
-            for i in range(len(slice_pts)):
-                sh = math.hypot(slice_pts[i][0] - pre_detour[i][0],
-                                slice_pts[i][1] - pre_detour[i][1])
-                if sh > max_shift:
-                    max_shift = sh
-            if max_shift > 0.05:
-                self.get_logger().info(
-                    f'[DETOUR_DIAG] progress_idx={self.progress_idx} end_idx={end_idx} '
-                    f'窗口{len(slice_pts)}点 最大偏移={max_shift:.2f}m '
-                    f'障碍数={len(self.obs_memory)} '
-                    f'pos=({rx:.1f},{ry:.1f}) 模式={self.mode}',
-                    throttle_duration_sec=0.5)
-
-        # ── 动态障碍物横向整体偏移 ───────────────────────────────────
-        if self.mode == 'DYNAMIC_AVOID':
-            slice_pts = self._apply_dynamic_detour(slice_pts, rx, ry, ryaw)
+                        '[DETOUR_LATCH_REUSE] publishing latched smooth path '
+                        f'len={len(slice_pts)}',
+                        throttle_duration_sec=2.0)
+            elif self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID'):
+                pre_detour = slice_pts[:]
+                bridge_detour = self._plan_bridge_detour(slice_pts, rx, ry, ryaw)
+                if bridge_detour is not None:
+                    slice_pts, hit_obs, hit_clear, min_clear = bridge_detour
+                    if self.detour_latch_once:
+                        self._latched_detour_path = slice_pts[:]
+                        self._latched_detour_meta = {
+                            'obs': hit_obs, 'clear': min_clear,
+                            'progress': self.progress_idx}
+                        self.get_logger().info(
+                            f'[DETOUR_LATCH_CREATE] obstacle=({hit_obs[0]:.1f},'
+                            f'{hit_obs[1]:.1f}) min_clear={min_clear:.2f}m '
+                            f'len={len(slice_pts)} progress={self.progress_idx}')
+                    else:
+                        self.get_logger().info(
+                            f'[BRIDGE_DETOUR] obstacle=({hit_obs[0]:.1f},'
+                            f'{hit_obs[1]:.1f}) nearest={hit_clear:.2f}m '
+                            f'min_clear={min_clear:.2f}m',
+                            throttle_duration_sec=0.5)
+                elif self.enable_repulsion_fallback:
+                    slice_pts = self._apply_detour(slice_pts)
+                if self.enable_dynamic_shift and self.mode == 'DYNAMIC_AVOID':
+                    slice_pts = self._apply_dynamic_detour(
+                        slice_pts, rx, ry, ryaw)
 
         self._publish_path(slice_pts)
 
@@ -852,8 +852,8 @@ class PlannerNode(Node):
         if not self.cov_pts:
             return float('inf')
         n = len(self.cov_pts)
-        lo = max(0, self.progress_idx - 10)
-        hi = min(n - 1, self.progress_idx + 60)
+        lo = max(0, self.progress_idx - self.gate_converge_back_idx)
+        hi = min(n - 1, self.progress_idx + self.gate_converge_ahead_idx)
         return self._distance_to_path_range(px, py, lo, hi)
 
     def _refresh_gate_path_distances(self):
@@ -909,7 +909,7 @@ class PlannerNode(Node):
             return float('inf')
         n = len(self.cov_pts)
         lo = self.progress_idx
-        hi = min(n - 1, self.progress_idx + 60)
+        hi = min(n - 1, self.progress_idx + self.gate_converge_ahead_idx)
         best_seg_d = float('inf')
         best_arc   = float('inf')
         arc = 0.0
@@ -945,10 +945,13 @@ class PlannerNode(Node):
                     throttle_duration_sec=2.0)
                 continue
             arc_dist = self._gate_along_path_distance(gate['x'], gate['y'])
-            if arc_dist < 2.0 or arc_dist > 15.0:
+            if (not math.isfinite(arc_dist)
+                    or arc_dist < self.gate_arc_min_dist
+                    or arc_dist > self.gate_arc_max_dist):
                 self.get_logger().info(
                     f'跳过强制穿门: gate={gate["id"]} '
-                    f'沿路径距离{arc_dist:.1f}m 不在 [2,15]m 范围',
+                    f'沿路径距离{arc_dist:.1f}m 不在 '
+                    f'[{self.gate_arc_min_dist:.1f},{self.gate_arc_max_dist:.1f}]m 范围',
                     throttle_duration_sec=2.0)
                 continue
             if not self._is_gate_path_collision_free(
@@ -1190,6 +1193,7 @@ class PlannerNode(Node):
             detour_amp,
             max(self.detour_shift, self.bridge_detour_max_shift),
         )
+        detour_amp = min(detour_amp, self.detour_shift_cap)
         plus_d = math.hypot(mx + nx * detour_amp - cx, my + ny * detour_amp - cy)
         minus_d = math.hypot(mx - nx * detour_amp - cx, my - ny * detour_amp - cy)
         sign = 1.0 if plus_d >= minus_d else -1.0
@@ -1280,6 +1284,7 @@ class PlannerNode(Node):
             detour_amp,
             max(min_safe_clear + 0.12, self.bridge_detour_max_shift),
         )
+        detour_amp = min(detour_amp, self.detour_shift_cap)
 
         current_clear = self._segment_min_clearance(pts, start_i, end_i)
         choices = {}
@@ -1339,7 +1344,8 @@ class PlannerNode(Node):
         obstacles = list(self.obs_memory.keys())
         out = []
         effective_range = max(self.inflate + 0.1, self.detour_range)
-        max_shift = max(self.detour_shift, self.bridge_detour_max_shift)
+        max_shift = min(max(self.detour_shift, self.bridge_detour_max_shift),
+                        self.detour_shift_cap)
         for x, y in pts:
             sx, sy = 0.0, 0.0
             for ox, oy in obstacles:
@@ -1358,6 +1364,92 @@ class PlannerNode(Node):
             out.append((x + sx, y + sy))
         return out
 
+    def _publish_gate_markers(self):
+        if not self.known_gates:
+            return
+        now = self.get_clock().now().to_msg()
+        ma = MarkerArray()
+        for gate in self.known_gates:
+            gid = int(gate.get('id', 0))
+            gx = float(gate.get('x', 0.0))
+            gy = float(gate.get('y', 0.0))
+            gyaw = float(gate.get('yaw', 0.0))
+            passed = bool(gate.get('passed', False))
+
+            ring = Marker()
+            ring.header.frame_id = 'odom'
+            ring.header.stamp = now
+            ring.ns = 'gate_status_ring'
+            ring.id = gid
+            ring.type = Marker.CYLINDER
+            ring.action = Marker.ADD
+            ring.pose.position.x = gx
+            ring.pose.position.y = gy
+            ring.pose.position.z = 0.06
+            ring.pose.orientation.w = 1.0
+            ring.scale.x = 1.4
+            ring.scale.y = 1.4
+            ring.scale.z = 0.08
+            ring.color.a = 0.70
+            if passed:
+                ring.color.r = 0.10
+                ring.color.g = 0.90
+                ring.color.b = 0.20
+            else:
+                ring.color.r = 0.95
+                ring.color.g = 0.75
+                ring.color.b = 0.15
+            ma.markers.append(ring)
+
+            arrow = Marker()
+            arrow.header.frame_id = 'odom'
+            arrow.header.stamp = now
+            arrow.ns = 'gate_status_heading'
+            arrow.id = 1000 + gid
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = gx
+            arrow.pose.position.y = gy
+            arrow.pose.position.z = 0.20
+            q = tft.quaternion_from_euler(0.0, 0.0, gyaw)
+            arrow.pose.orientation.x = q[0]
+            arrow.pose.orientation.y = q[1]
+            arrow.pose.orientation.z = q[2]
+            arrow.pose.orientation.w = q[3]
+            arrow.scale.x = 1.2
+            arrow.scale.y = 0.15
+            arrow.scale.z = 0.15
+            arrow.color.a = 0.95
+            if passed:
+                arrow.color.r = 0.10
+                arrow.color.g = 0.95
+                arrow.color.b = 0.20
+            else:
+                arrow.color.r = 0.95
+                arrow.color.g = 0.75
+                arrow.color.b = 0.15
+            ma.markers.append(arrow)
+
+            label = Marker()
+            label.header.frame_id = 'odom'
+            label.header.stamp = now
+            label.ns = 'gate_status_label'
+            label.id = 2000 + gid
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = gx
+            label.pose.position.y = gy
+            label.pose.position.z = 1.0
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.45
+            label.color.a = 1.0
+            label.color.r = 1.0
+            label.color.g = 1.0
+            label.color.b = 1.0
+            label.text = f'Gate {gid}: {"PASS" if passed else "PENDING"}'
+            ma.markers.append(label)
+        self.pub_gate_markers.publish(ma)
+
     def _nearest_obstacle_distance(self, rx: float, ry: float) -> float:
         """估算机器人到当前障碍集的最近距离（世界坐标）。"""
         best = 999.0
@@ -1372,6 +1464,14 @@ class PlannerNode(Node):
         return best
 
     # ── Unified planner state machine ───────────────────────────────────
+
+    def _clear_detour_latch(self, reason: str = ''):
+        if self._latched_detour_path is not None:
+            self.get_logger().info(
+                f'[DETOUR_LATCH_CLEAR] reason={reason} '
+                f'meta={self._latched_detour_meta}')
+            self._latched_detour_path = None
+            self._latched_detour_meta = None
 
     def _transition_state(self, new_state: 'PlannerState', reason: str = ''):
         old = self._planner_state
@@ -1391,11 +1491,15 @@ class PlannerNode(Node):
             self._detour_clear_pending = False
             self._bridge_hold_ticks = 0
             self._last_bridge_result = None
+            self._clear_detour_latch('recovery_active')
         elif new_state == PlannerState.POST_RECOVERY_REPLAN:
             self._recovery_replan_bridge = []
         elif new_state == PlannerState.NORMAL:
             self._detour_start_idx = None
             self._detour_clear_pending = False
+            self._clear_detour_latch('normal')
+        elif new_state == PlannerState.REJOIN_PENDING:
+            self._clear_detour_latch('rejoin_pending')
         self._planner_state = new_state
         self._cov_version_at_state_entry = self._cov_version
 

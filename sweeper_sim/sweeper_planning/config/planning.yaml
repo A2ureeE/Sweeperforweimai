@@ -35,6 +35,7 @@ planner_node:
     obstacle_memory_s:     8.0
     gate_align_dist:       4.0
     detour_shift_m:        0.8
+    detour_max_shift_ratio_of_width: 0.5
     bridge_detour_max_shift_m: 1.05
     enable_group_detour:   false
     obstacle_group_cluster_dist: 2.0
@@ -49,3 +50,7 @@ planner_node:
     gate_path_max_dist:    1.5
     gate_converge_path_weight: 10.0
     gate_robot_dist_weight: 1.0
+    gate_converge_back_idx: 10
+    gate_converge_ahead_idx: 120
+    gate_arc_min_dist: 1.0
+    gate_arc_max_dist: 25.0

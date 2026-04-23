@@ -51,7 +51,7 @@ Visualization Manager:
     - Class: rviz_default_plugins/MarkerArray
       Name: Gates
       Topic:
-        Value: /perception/gates
+        Value: /planner/gate_markers
       Enabled: true
     - Class: rviz_default_plugins/MarkerArray
       Name: Edges

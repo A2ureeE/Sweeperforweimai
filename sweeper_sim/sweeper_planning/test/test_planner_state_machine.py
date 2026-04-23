@@ -21,6 +21,8 @@ class FakePlannerNode:
         self._cov_version = 0
         self._cov_version_at_state_entry = 0
         self._detour_exit_t = 0.0
+        self._latched_detour_path = None
+        self._latched_detour_meta = None
         self.mode = 'COVERAGE'
         self.progress_idx = 0
         self.robot = (0.0, 0.0, 0.0)
@@ -44,6 +46,10 @@ class FakePlannerNode:
     def get_logger(self):
         logger = MagicMock()
         return logger
+
+    def _clear_detour_latch(self, reason=''):
+        from sweeper_planning.planner_node import PlannerNode
+        PlannerNode._clear_detour_latch(self, reason)
 
     def _transition_state(self, new_state, reason=''):
         from sweeper_planning.planner_node import PlannerNode
@@ -147,6 +153,53 @@ class TestPlannerStateMachine(unittest.TestCase):
         p._update_planner_state(0, 0, 0, 1.0)
         self.assertTrue(len(p._transition_log) >= 1)
         self.assertEqual(p._transition_log[-1][0], PlannerState.STATIC_DETOUR)
+
+    # ── Detour latch lifecycle ──────────────────────────────────────────
+
+    def test_latch_cleared_on_leaving_detour(self):
+        """Latch should be cleared when transitioning to REJOIN_PENDING."""
+        p = self._make()
+        p._planner_state = PlannerState.STATIC_DETOUR
+        p._latched_detour_path = [(0, 0), (1, 1)]
+        p._latched_detour_meta = {'obs': (1, 0)}
+        p.mode = 'COVERAGE'
+        p._update_planner_state(0, 0, 0, 10.0)
+        self.assertEqual(p._planner_state, PlannerState.REJOIN_PENDING)
+        self.assertIsNone(p._latched_detour_path)
+        self.assertIsNone(p._latched_detour_meta)
+
+    def test_latch_cleared_on_recovery(self):
+        """Latch should be cleared when entering RECOVERY_ACTIVE."""
+        p = self._make()
+        p._planner_state = PlannerState.STATIC_DETOUR
+        p._latched_detour_path = [(0, 0), (1, 1)]
+        p._latched_detour_meta = {'obs': (1, 0)}
+        p._controller_recovering = True
+        p._update_planner_state(0, 0, 0, 1.0)
+        self.assertEqual(p._planner_state, PlannerState.RECOVERY_ACTIVE)
+        self.assertIsNone(p._latched_detour_path)
+
+    def test_latch_cleared_on_return_to_normal(self):
+        """Latch should be cleared when transitioning from detour to NORMAL."""
+        p = self._make()
+        p._planner_state = PlannerState.DYNAMIC_AVOID
+        p._latched_detour_path = [(2, 2), (3, 3)]
+        p._latched_detour_meta = {'obs': (1, 0)}
+        p.mode = 'COVERAGE'
+        p._update_planner_state(0, 0, 0, 20.0)
+        self.assertEqual(p._planner_state, PlannerState.REJOIN_PENDING)
+        self.assertIsNone(p._latched_detour_path)
+
+    def test_latch_survives_within_same_detour_episode(self):
+        """Latch should NOT be cleared while staying in STATIC_DETOUR."""
+        p = self._make()
+        p._planner_state = PlannerState.STATIC_DETOUR
+        p._latched_detour_path = [(0, 0), (1, 1)]
+        p._latched_detour_meta = {'obs': (1, 0)}
+        p.mode = 'STATIC_DETOUR'
+        p._update_planner_state(0, 0, 0, 2.0)
+        self.assertEqual(p._planner_state, PlannerState.STATIC_DETOUR)
+        self.assertIsNotNone(p._latched_detour_path)
 
 
 if __name__ == '__main__':
