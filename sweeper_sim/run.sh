@@ -36,16 +36,44 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
   export QT_QPA_PLATFORM=offscreen
 fi
 
-# Kill any zombie gazebo instances left from a previous ^Z / crash,
-# otherwise the new gzserver fails with
-#   "Unable to start server[bind: Address already in use]"
-if pgrep -x gzserver >/dev/null || pgrep -x gzclient >/dev/null; then
-  echo "[sweeper] Killing stale gzserver/gzclient..."
-  pkill -9 -x gzserver  2>/dev/null || true
-  pkill -9 -x gzclient  2>/dev/null || true
-  pkill -9 -x gazebo    2>/dev/null || true
-  sleep 1
+# ---------------------------------------------------------------
+# Aggressive pre-flight cleanup.  ROS nodes launched by ros2 launch
+# don't always shut down cleanly on SIGINT - especially when the
+# parent terminal is killed abruptly - and stale coverage_node /
+# controller_node / behavior_node instances will race with the
+# fresh ones over the same topics, causing mysterious "path keeps
+# rebuilding" or "cmd_vel jitter" bugs.  Kill everything first.
+# ---------------------------------------------------------------
+echo "[sweeper] Pre-flight cleanup: killing any stale sim processes..."
+pkill -9 -x gzserver          2>/dev/null || true
+pkill -9 -x gzclient          2>/dev/null || true
+pkill -9 -x gazebo            2>/dev/null || true
+pkill -9 -f 'ros2 launch sweeper' 2>/dev/null || true
+pkill -9 -f '/sweeper_sim/install' 2>/dev/null || true
+pkill -9 -f 'coverage_node'   2>/dev/null || true
+pkill -9 -f 'controller_node' 2>/dev/null || true
+pkill -9 -f 'planner_node'    2>/dev/null || true
+pkill -9 -f 'behavior_node'   2>/dev/null || true
+pkill -9 -f 'perception_node' 2>/dev/null || true
+pkill -9 -f 'moving_obstacle' 2>/dev/null || true
+pkill -9 -f 'mission_runner'  2>/dev/null || true
+pkill -9 -f 'score_logger'    2>/dev/null || true
+pkill -9 -f 'robot_state_publisher' 2>/dev/null || true
+sleep 2
+# Second pass: anything that survived
+if pgrep -f '/sweeper_sim/install' >/dev/null 2>&1; then
+  echo "[sweeper] WARNING: survivors detected, second pass kill..."
+  pkill -9 -f '/sweeper_sim/install' 2>/dev/null || true
+  sleep 2
 fi
+# Final check
+if pgrep -f '/sweeper_sim/install' >/dev/null 2>&1 \
+   || pgrep -x gzserver >/dev/null 2>&1; then
+  echo "[sweeper] ERROR: could not clean up stale processes:" >&2
+  pgrep -af '/sweeper_sim/install|gzserver|gzclient' >&2 || true
+  exit 1
+fi
+echo "[sweeper] Pre-flight cleanup OK."
 
 source /opt/ros/humble/setup.bash
 # Some systems (notably when gazebo was installed after ROS) don't get

@@ -27,7 +27,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped, PolygonStamped, PoseArray
@@ -54,6 +54,9 @@ class PlannerNode(Node):
             ('detour_shift_m',             1.0),
             ('stagnation_time_s',          6.0),
             ('stagnation_min_dist_total',  0.5),
+            # 避障回切迟滞：考虑车身长度，避免车尾尚未通过障碍就回切原路径
+            ('rejoin_tail_clearance_m',    2.1),
+            ('rejoin_min_hold_s',          0.8),
             # 穿门路径参数
             ('gate_approach_dist',         1.2),  # 门前等待点距门中心的距离
             ('gate_exit_dist',             2.5),  # 门后目标点距门中心的距离
@@ -68,13 +71,18 @@ class PlannerNode(Node):
         self.detour_shift    = g('detour_shift_m').value
         self.stag_time       = g('stagnation_time_s').value
         self.stag_min_d      = g('stagnation_min_dist_total').value
+        self.rejoin_tail_clearance = float(g('rejoin_tail_clearance_m').value)
+        self.rejoin_min_hold_s = float(g('rejoin_min_hold_s').value)
         self.gate_approach   = g('gate_approach_dist').value
         self.gate_exit       = g('gate_exit_dist').value
         self.dyn_predict_s   = g('dyn_predict_s').value
 
         sensor_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # coverage/path 是 transient_local 发布；这里同样用 transient_local 订阅，
+        # 避免 planner 晚于 coverage 启动时拿不到路径（n=0）。
+        path_latch_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.sub_path      = self.create_subscription(
-            Path,            '/coverage/path',                  self.cb_cov,       5)
+            Path,            '/coverage/path',                  self.cb_cov,       path_latch_qos)
         self.sub_odom      = self.create_subscription(
             Odometry,        '/odom',                           self.cb_odom,      sensor_qos)
         self.sub_obs       = self.create_subscription(
@@ -112,6 +120,18 @@ class PlannerNode(Node):
         self._prev_mode             = 'COVERAGE'
         self._detour_start_idx      = None
         self._returning_from_detour = False
+        self._detour_clear_pending  = False
+        self._detour_exit_t         = 0.0
+
+        # R4: 启动时间戳，用于初始强制 progress_idx=0
+        # controller_node 延迟 10s 启动（launch 里 delayed_controller period=10），
+        # 在此之前车辆不会移动。warmup 必须覆盖这段时间，否则 stagnation
+        # 检测会在 6s 时把 progress 跳到 +20，跳过整个外环。
+        self._t_start = time.time()
+        self._warmup_sec = 12.0  # 覆盖 controller 延迟 10s + 2s 缓冲
+        self._warmup_log_done = False
+        # R4: progress 跳变日志（只记录启动后 20 秒内的变化）
+        self._last_logged_progress = -1
 
         self.create_timer(0.2, self.tick)
         self.create_timer(5.0, self._log_status)
@@ -196,32 +216,72 @@ class PlannerNode(Node):
 
         if entering_detour and self._detour_start_idx is None:
             self._detour_start_idx = self.progress_idx
+            self._detour_clear_pending = False
             self.get_logger().info(
                 f'进入避障模式，保存路径位置 idx={self.progress_idx}')
 
         if leaving_detour and self._detour_start_idx is not None:
-            if self._detour_start_idx < self.progress_idx - 3:
+            # 进入“待清障”阶段：不要立刻回切原路径，要等车尾也越过障碍。
+            # 否则车头刚过杆子就回切，尾部会扫到杆子。
+            self._detour_clear_pending = True
+            self._detour_exit_t = now
+            self.get_logger().info(
+                f'避障结束，进入尾部清障等待: idx={self.progress_idx}')
+
+        # 尾部清障判定：只有满足“时间 + 距离”双条件才发送 cleared。
+        if self._detour_clear_pending:
+            min_obs_d = self._nearest_obstacle_distance(rx, ry)
+            hold_s = now - self._detour_exit_t
+            if hold_s >= self.rejoin_min_hold_s and min_obs_d >= self.rejoin_tail_clearance:
                 self.get_logger().info(
-                    f'避障结束，回退至原路径: '
-                    f'idx {self.progress_idx}→{self._detour_start_idx}')
-                self.progress_idx = self._detour_start_idx
-                self._returning_from_detour = True
-            self._detour_start_idx = None
-            # 通知 behavior_node 和 controller：避障结束，可以恢复路径跟踪
-            self.pub_detour_end.publish(String(data='cleared'))
+                    f'避障回切放行: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m '
+                    f'>= {self.rejoin_tail_clearance:.2f}m')
+                self._detour_clear_pending = False
+                self._detour_start_idx = None
+                self._returning_from_detour = False
+                # 通知 behavior_node 和 controller：避障结束，可以恢复路径跟踪
+                self.pub_detour_end.publish(String(data='cleared'))
+            else:
+                self.get_logger().info(
+                    f'避障回切等待: hold={hold_s:.1f}s, min_obs={min_obs_d:.2f}m',
+                    throttle_duration_sec=1.0)
 
         self._prev_mode = self.mode
 
+        # ── R4: 启动 warmup，前 N 秒强制 progress_idx=0 ─────────────────
+        warmup_elapsed = now - self._t_start
+        in_warmup = warmup_elapsed < self._warmup_sec
+        if in_warmup:
+            self.progress_idx = 0
+            # warmup 期间持续重置 stagnation 计时器，防止 warmup 结束时
+            # stagnation 立即把 progress 跳 +20 跳过外环
+            self._stag_accum_d = 0.0
+            self._stag_start_t = now
+            if not self._warmup_log_done:
+                self.get_logger().info(
+                    f'[R4 warmup] 前 {self._warmup_sec:.1f}s 强制 progress_idx=0, '
+                    f'pos=({rx:.1f},{ry:.1f}), 路径前 3 点='
+                    f'{[(round(float(pts[i][0]),2), round(float(pts[i][1]),2)) for i in range(min(3, n))]}')
+                self._warmup_log_done = True
+
         # ── 前向滑动窗口推进 ────────────────────────────────────────────
         old_idx = self.progress_idx
-        if self.progress_idx == 0 and not self._returning_from_detour:
-            # 机器人从起点出发时，只在窗口内搜索最近点，避免永远卡在 0
+        if in_warmup:
+            # warmup 期间不推进 progress，直接发布头部参考窗口
+            nearest_dist = 0.0  # 占位
+        elif self.progress_idx == 0 and not self._returning_from_detour:
+            # 刚结束 warmup，从 idx=0 开始逐步推进
             window_end = min(n - 1, self.progress_idx + 10)
             sub = pts[self.progress_idx: window_end + 1]
             d2 = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
             nearest_in_window = int(np.argmin(d2))
-            self.progress_idx = max(self.progress_idx, self.progress_idx + nearest_in_window)
-            self.get_logger().debug(f'[DEBUG] 分支1: idx 0→{self.progress_idx}, pos=({rx:.1f},{ry:.1f})')
+            nearest_dist = math.sqrt(float(d2[nearest_in_window]))
+            # 只有距离 < 3m 才用 argmin 推进；否则每 tick 推 1 点（等车开到附近）
+            if nearest_dist < 3.0:
+                self.progress_idx = max(self.progress_idx, self.progress_idx + nearest_in_window)
+            else:
+                self.progress_idx = min(n - 1, self.progress_idx + 1)
+            self.get_logger().debug(f'[DEBUG] 分支1: idx 0→{self.progress_idx}, dist={nearest_dist:.1f}m, pos=({rx:.1f},{ry:.1f})')
         elif self._returning_from_detour:
             window_end = min(n - 1, self.progress_idx + 50)
             sub  = pts[self.progress_idx: window_end + 1]
@@ -235,11 +295,44 @@ class PlannerNode(Node):
                 self.get_logger().info(
                     f'已回到原路径, dist={nearest_dist:.2f}m')
         else:
-            window_end = min(n - 1, self.progress_idx + 10)
+            # 搜索窗口 +30 点（~10m），在正常跟随时 argmin 推进若干点；
+            # 大脱线时 argmin 可能跳到后段，用距离 gating 避免跳跃。
+            window_end = min(n - 1, self.progress_idx + 30)
             sub  = pts[self.progress_idx: window_end + 1]
             d2   = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
-            new_idx = self.progress_idx + int(np.argmin(d2))
+            argmin_rel = int(np.argmin(d2))
+            nearest_dist = math.sqrt(float(d2[argmin_rel]))
+            if nearest_dist < 3.0:
+                new_idx = self.progress_idx + argmin_rel
+            else:
+                # 距离过大：progress 不跳跃，只推进 1 点，交给控制器把车拉回
+                new_idx = min(n - 1, self.progress_idx + 1)
             self.progress_idx = max(self.progress_idx, new_idx)
+
+        # R4 诊断：启动后 20 秒内每次 progress_idx 变化都打印一行
+        if warmup_elapsed < 20.0 and self.progress_idx != self._last_logged_progress:
+            self.get_logger().info(
+                f'[progress_jump] {old_idx}→{self.progress_idx} '
+                f'dist={nearest_dist:.2f}m t={warmup_elapsed:.2f}s '
+                f'pos=({rx:.1f},{ry:.1f})')
+            self._last_logged_progress = self.progress_idx
+
+        # ── 本地重同步：progress 点离车过远时，按邻域最近点修正 ────────────
+        # 目的：避免 progress 与车辆位置脱钩导致角点“反方向打舵”。
+        if n > 0:
+            px, py = pts[self.progress_idx]
+            d_prog = math.hypot(rx - float(px), ry - float(py))
+            if d_prog > 4.0:
+                lo = max(0, self.progress_idx - 80)
+                hi = min(n - 1, self.progress_idx + 80)
+                sub = pts[lo:hi + 1]
+                d2 = np.sum((sub - np.array([rx, ry])) ** 2, axis=1)
+                rel = int(np.argmin(d2))
+                new_idx = lo + rel
+                self.get_logger().warn(
+                    f'[progress_resync] idx {self.progress_idx}→{new_idx} '
+                    f'd={d_prog:.1f}m pos=({rx:.1f},{ry:.1f})')
+                self.progress_idx = new_idx
 
         # ── 停滞检测 ────────────────────────────────────────────────
         if self._last_stag_pos is not None:
@@ -300,6 +393,12 @@ class PlannerNode(Node):
         rx, ry, ryaw = self.robot
         n = len(self.cov_pts)
         pct = self.progress_idx / max(1, n - 1) * 100 if n > 1 else 0
+        # 计算到当前 progress 点的距离，辅助判断路径跟踪精度
+        if n > 0 and self.progress_idx < n:
+            pp = self.cov_pts[self.progress_idx]
+            d_to_prog = math.hypot(rx - pp[0], ry - pp[1])
+        else:
+            d_to_prog = -1.0
         self.get_logger().info(
             f'[规划] 模式={self.mode} | '
             f'路径进度={self.progress_idx}/{n} ({pct:.1f}%) | '
@@ -307,7 +406,8 @@ class PlannerNode(Node):
             f'动态障碍={len(self.dyn_obstacles)}个 | '
             f'窄门={"检测到" if self.gate_pose else "无"} | '
             f'停滞累积={self._stag_accum_d:.2f}m | '
-            f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}°')
+            f'位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}° '
+            f'到prog点={d_to_prog:.1f}m')
 
     # ── 穿门路径生成 ─────────────────────────────────────────────────────
     def _build_gate_path(self, rx, ry, ryaw) -> list:
@@ -416,6 +516,19 @@ class PlannerNode(Node):
                     sy += rep * ny * self.detour_shift
             out.append((x + sx, y + sy))
         return out
+
+    def _nearest_obstacle_distance(self, rx: float, ry: float) -> float:
+        """估算机器人到当前障碍集的最近距离（世界坐标）。"""
+        best = 999.0
+        for ox, oy in self.obs_memory.keys():
+            d = math.hypot(rx - ox, ry - oy)
+            if d < best:
+                best = d
+        for wx, wy, *_ in self.dyn_obstacles:
+            d = math.hypot(rx - wx, ry - wy)
+            if d < best:
+                best = d
+        return best
 
     # ── 发布路径 ─────────────────────────────────────────────────────────
     def _publish_path(self, pts: list):

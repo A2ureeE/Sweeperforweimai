@@ -96,11 +96,16 @@ def generate_launch_description():
     gui_arg  = DeclareLaunchArgument('gui',  default_value='true')
     rviz_arg = DeclareLaunchArgument('rviz', default_value='true')
     edge_follow_arg = DeclareLaunchArgument('enable_edge_follow', default_value='false')
+    # world:=diag_no_walls.world 可切到无墙测试世界（隔离墙壁/行人影响，纯控制回归）
+    world_arg = DeclareLaunchArgument(
+        'world',
+        default_value=m.get('world_file', 'sweep_course.world'),
+        description='World file name under sweeper_gazebo/worlds/')
 
     # ── 1. Gazebo + robot ─────────────────────────────────────────────
-    world_file = os.path.join(
-        pkg_gazebo, 'worlds',
-        m.get('world_file', 'sweep_course.world'))
+    import launch.substitutions as subs
+    world_file = subs.PathJoinSubstitution([
+        pkg_gazebo, 'worlds', LaunchConfiguration('world')])
 
     gazebo_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -200,6 +205,7 @@ def generate_launch_description():
         gui_arg,
         rviz_arg,
         edge_follow_arg,
+        world_arg,
         gazebo_launch,
         rviz_node,
         delayed_nodes,

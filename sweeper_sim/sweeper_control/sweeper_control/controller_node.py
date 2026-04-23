@@ -515,19 +515,48 @@ class ControllerNode(Node):
 
     # ── 路径弯道检测（U-turn 即将到来时抑制避障）───────────────────────
     def _has_upcoming_turn(self) -> bool:
+        """检测前方路径是否有急弯（包括 Headland 90° 圆角与 Skip-Row U-turn）。
+
+        前瞻距离必须覆盖 URDF 插件带来的"指令 0.2 m/s → 实跑 0.59 m/s"的 3x 超调，
+        以及 max_wheel_torque=600Nm 下的惯性制动距离。以 0.6 m/s 全速行驶时，
+        需至少 3s 预警时间才能减到安全入弯速度（<0.15 m/s），
+        对应路径距离 ≈ 1.8m + 入弯前 1m 缓冲 ≈ 3m 前瞻。
+        旧值：仅 2m 前瞻 → 预警触发时车已冲入弯，Stanley 惯性外滑。
+        新值：5m 前瞻 → 至少 8s 预警，车辆有足够时间减速。"""
         pts = self.ref
         n   = len(pts)
         if n < 5:
             return False
-        # 防御性边界检查：确保索引在有效范围内
         idx = max(0, min(self.ref_idx_hint, n - 1))
-        # 基于路径前方曲率检测：kappa > 0.4 说明前方有急弯（U-turn）
-        for offset in [5, 10, 15, 20]:
+        # 阈值 0.25 rad/m 对应 4m 转弯半径，能捕捉 Headland(1.95m) 与 U-turn(1.95m) 圆弧
+        for offset in [5, 10, 20, 30, 40, 50]:
             ci = min(n - 1, idx + offset)
             kappa = abs(self._estimate_curvature(ci))
-            if kappa > 0.4:
+            if kappa > 0.25:
                 return True
         return False
+
+    def _upcoming_turn_distance(self) -> float:
+        """返回距最近急弯的路径距离（米），若前方 8m 内无急弯则返回 ∞。
+        同时：若车辆已在弯中（当前 idx 或最近几个点 κ>0.25），返回 0。"""
+        pts = self.ref
+        n   = len(pts)
+        if n < 5:
+            return float('inf')
+        idx = max(0, min(self.ref_idx_hint, n - 1))
+        # 当前点及前后 3 点若已在弯中，立即返回 0 距离（强制降速）
+        for i in range(max(0, idx - 3), min(n, idx + 4)):
+            if abs(self._estimate_curvature(i)) > 0.25:
+                return 0.0
+        # 否则向前扫描查找最近的弯
+        dist = 0.0
+        for i in range(idx, min(n - 1, idx + 80)):
+            if abs(self._estimate_curvature(i)) > 0.25:
+                return dist
+            dx = pts[i+1][0] - pts[i][0]
+            dy = pts[i+1][1] - pts[i][1]
+            dist += math.hypot(dx, dy)
+        return float('inf')
 
     def _is_in_uturn(self) -> bool:
         """U-turn 状态机：进入基于路径曲率 + 距弧心距离，退出基于**带符号累计航向旋转**。
@@ -584,6 +613,7 @@ class ControllerNode(Node):
                 throttle_duration_sec=1.0)
             self._in_uturn = False
             self._uturn_logged = False
+            self._uturn_resync_ref_idx(rx, ry, reason='normal_exit')
             return False
 
         # 条件2：长时间卡住（速度 < 0.02 m/s 持续 2.5s）
@@ -598,6 +628,7 @@ class ControllerNode(Node):
                 self._in_uturn = False
                 self._uturn_logged = False
                 self._uturn_stuck_t = 0.0
+                self._uturn_resync_ref_idx(rx, ry, reason='stuck')
                 return False
         else:
             self._uturn_stuck_t = 0.0
@@ -614,6 +645,7 @@ class ControllerNode(Node):
                 self._in_uturn = False
                 self._uturn_logged = False
                 self._uturn_north_t = 0.0
+                self._uturn_resync_ref_idx(rx, ry, reason='wall_alarm')
                 return False
         else:
             self._uturn_north_t = 0.0
@@ -626,19 +658,44 @@ class ControllerNode(Node):
                 throttle_duration_sec=1.0)
             self._in_uturn = False
             self._uturn_logged = False
+            self._uturn_resync_ref_idx(rx, ry, reason='timeout')
             return False
 
         # Sticky：在 U-turn 内，其他任何条件都不触发退出
         return True
 
+    def _uturn_resync_ref_idx(self, rx, ry, reason: str = ''):
+        """R3：U-turn 退出时把 ref_idx_hint 重同步到当前位置在 self.ref 上的最近点。
+
+        U-turn 期间（尤其异常超时退出）ref_idx_hint 被冻结；若直接恢复 Stanley，
+        目标点可能远在车辆身后或方向相反，导致 CTE 巨大并二次失控。
+        """
+        if not self.ref or len(self.ref) < 2:
+            return
+        best_d = float('inf')
+        best_i = self.ref_idx_hint
+        for i, (px, py, _) in enumerate(self.ref):
+            d = (rx - px) ** 2 + (ry - py) ** 2
+            if d < best_d:
+                best_d = d
+                best_i = i
+        old = self.ref_idx_hint
+        self.ref_idx_hint = best_i
+        self.get_logger().info(
+            f'[U-turn resync] ref_idx_hint {old}→{best_i}/{len(self.ref)} '
+            f'dist={math.sqrt(best_d):.2f}m reason={reason}')
+
     def _check_uturn_entry(self, rx, ry, ryaw) -> bool:
         """判断是否应该进入 U-turn 模式。
         必要条件：
           ① 前方路径在较近距离内有急弯（kappa > 0.4）
-          ② 车辆距离该弯段入口足够近（沿路径距离 < 2.0m）
-          ③ 弯段末端位置在车辆前方（不会从后方触发）
+          ② 车辆距离该弯段入口足够近（沿路径距离 < 1.2m，R2 修正 2.0→1.2）
+          ③ 弯段累计航向变化 ≥ 140°（区分真正的 U-turn 与 Headland 90° 圆角）
+              累加在第一个 κ<0.15 的点处 *立即* 打断（R2 修正，防止跨多段弯误累加）
+          ④ 几何可行性检查（_verify_uturn_feasibility）通过
 
-        注：还会调用 _verify_uturn_feasibility 做几何可行性检查。
+        注：R2 修正后，_check_uturn_entry 只在单段连续急弯时触发；
+        Headland 90° 圆角 + 其他弯道叠加造成的 289° 假急弯不再触发 U-turn。
         """
         pts = self.ref
         n   = len(pts)
@@ -661,8 +718,36 @@ class ControllerNode(Node):
                 arc_entry_dist += math.hypot(
                     pts[i+1][0] - pts[i][0],
                     pts[i+1][1] - pts[i][1])
-        if arc_entry_dist > 2.0:
-            return False  # 还太远，先用 Stanley
+        if arc_entry_dist > 1.2:
+            return False  # 还太远，先用 Stanley（R2: 2.0→1.2）
+
+        # 条件③：检查后续弯段累计航向变化
+        # 从 sharp_idx 开始沿路径向前扫描，累计相邻切线夹角。
+        # R2: 只要遇到 κ<0.15 立即打断，不再跨多段弯累加。
+        total_turn = 0.0
+        scan_dist = 0.0
+        prev_heading = None
+        for i in range(sharp_idx, min(n - 1, sharp_idx + 80)):
+            hx = pts[i+1][0] - pts[i][0]
+            hy = pts[i+1][1] - pts[i][1]
+            seg = math.hypot(hx, hy)
+            if seg < 1e-4:
+                continue
+            hdg = math.atan2(hy, hx)
+            if prev_heading is not None:
+                total_turn += abs(wrap(hdg - prev_heading))
+            prev_heading = hdg
+            scan_dist += seg
+            # 走过 8m 认为弯段结束
+            if scan_dist > 8.0:
+                break
+            # R2: 只要 κ 回落（< 0.15）就立即打断，不再要求 >= 3 点
+            if i > sharp_idx and abs(self._estimate_curvature(i)) < 0.15:
+                break
+
+        if total_turn < math.radians(140):
+            # 不足 140°, 认为是 Headland 圆角或普通弯道，用 Stanley 跟踪
+            return False
 
         # 几何可行性检查（确认 U-turn 弧半径够大，不会撞墙）
         if not self._verify_uturn_feasibility(sharp_idx):
@@ -681,7 +766,8 @@ class ControllerNode(Node):
         self._uturn_reversed = False
         self.get_logger().info(
             f'[U-turn] 进入 | 位置=({rx:.1f},{ry:.1f}) 航向={math.degrees(ryaw):.0f}° '
-            f'| 弯段idx={sharp_idx}/{n} 距离={arc_entry_dist:.2f}m',
+            f'| 弯段idx={sharp_idx}/{n} 距离={arc_entry_dist:.2f}m '
+            f'| 累计转角={math.degrees(total_turn):.0f}°',
             throttle_duration_sec=1.0)
         return True
 
@@ -853,14 +939,18 @@ class ControllerNode(Node):
     def _front_obstacle_info(self):
         """扫描前方锥形区域，返回 (最小距离, 转向方向)。
         转向方向: +1 = 向左转 (omega>0), -1 = 向右转（朝更开阔的一侧）。
-        近距离障碍物自动扩大检测角度以覆盖车身宽度。
+
+        逻辑：
+          1) 优先使用“非墙体”回波，避免沿边作业时被墙干扰；
+          2) 若没有非墙体，但前方墙体已经很近，也要触发反应式避障（防撞墙兜底）。
         """
         if not self.scan_ranges:
             return 999.0, 0.0
         if self.robot is None:
             return 999.0, 0.0
         rx, ry, ryaw, _ = self.robot
-        min_dist  = 999.0
+        min_nonwall = 999.0
+        min_any = 999.0
         left_min  = 999.0
         right_min = 999.0
         for i, r in enumerate(self.scan_ranges):
@@ -869,19 +959,23 @@ class ControllerNode(Node):
             angle = self.scan_angle_min + i * self.scan_angle_inc
             if abs(angle) > self.front_half:
                 continue
-            # 避障层忽略墙壁回波，墙壁由规划层和贴边控制处理
             wx = rx + r * math.cos(angle + ryaw)
             wy = ry + r * math.sin(angle + ryaw)
-            if self._is_wall_point(wx, wy):
-                continue
-            if r < min_dist:
-                min_dist = r
+            min_any = min(min_any, r)
+            if not self._is_wall_point(wx, wy):
+                min_nonwall = min(min_nonwall, r)
             if angle >= 0:
                 left_min = min(left_min, r)
             else:
                 right_min = min(right_min, r)
         steer_dir = 1.0 if right_min < left_min else -1.0
-        return min_dist, steer_dir
+        if min_nonwall < 999.0:
+            return min_nonwall, steer_dir
+        # 兜底：前方仅检测到墙体时，近距离也触发避障，防止“撞墙仍显示 none”。
+        wall_trigger_dist = max(self.obs_slow_d * 1.2, 1.0)
+        if min_any < wall_trigger_dist:
+            return min_any, steer_dir
+        return 999.0, steer_dir
 
     def _is_wall_point(self, wx: float, wy: float) -> bool:
         m = self.wall_filter_margin
@@ -926,25 +1020,60 @@ class ControllerNode(Node):
 
         idx = self.ref_idx_hint
         nxt = min(idx + 1, n - 1)
-        path_yaw = math.atan2(pts[nxt][1] - pts[idx][1],
-                               pts[nxt][0] - pts[idx][0])
+        # 当 idx 已到窗口末尾时 nxt == idx，atan2(0,0) 会返回 0.0（伪 east），
+        # 导致 path_yaw 偏差极大。此时退化到用前一段方向 (pts[idx-1]→pts[idx])。
+        if nxt > idx:
+            path_yaw = math.atan2(pts[nxt][1] - pts[idx][1],
+                                  pts[nxt][0] - pts[idx][0])
+        elif idx > 0:
+            path_yaw = math.atan2(pts[idx][1] - pts[idx-1][1],
+                                  pts[idx][0] - pts[idx-1][0])
+        else:
+            path_yaw = ryaw  # 整个路径只有一个点，用车头方向兜底
         heading_err = wrap(path_yaw - ryaw)
 
         px, py, _ = pts[idx]
         dx = rx - px;  dy = ry - py
         cte = -math.sin(path_yaw) * dx + math.cos(path_yaw) * dy
 
-        # 抑制后向分量
-        angle_to_next = math.atan2(pts[nxt][1] - ry, pts[nxt][0] - rx)
-        behind = abs(wrap(angle_to_next - ryaw)) > 1.8
-        if behind:
-            heading_err *= 0.3
-            cte         *= 0.3
-
-        v_eps  = max(0.5, rv)
-        delta  = (self.stanley_hg * heading_err -
-                  math.atan2(self.stanley_k * cte, v_eps))
-        delta  = max(-self.delta_max, min(self.delta_max, delta))
+        # ── 脱线鲁棒性：严重偏离或路径附近曲率高时切 Pure Pursuit ────────
+        # 原因：Stanley 在弧外侧时 path_yaw（切线方向）与实际需要转向方向会
+        # 出现符号矛盾（heading_err 要求+，cte 要求-，抵消或反号）。
+        # 另：当 idx 被推到 ref 窗口末尾时，path_yaw 用前一段兜底也可能偏差
+        # 很大。Pure Pursuit 瞄准前方一段路径上的目标点，对脱线拓扑更鲁棒。
+        local_kappa_abs = abs(self._estimate_curvature(idx))
+        off_track = abs(cte) > 0.3      # 降低阈值：0.3m 起切 PP
+        in_curve  = local_kappa_abs > 0.25
+        at_ref_end = (idx >= n - 3)     # idx 接近窗口末尾时 Stanley 不可靠
+        if off_track or in_curve or at_ref_end:
+            Ld = max(1.2, 2.5 * max(0.15, rv))  # 前视距离随速度增加
+            tgt_i = idx
+            acc = 0.0
+            while tgt_i + 1 < n:
+                acc += math.hypot(pts[tgt_i+1][0] - pts[tgt_i][0],
+                                  pts[tgt_i+1][1] - pts[tgt_i][1])
+                tgt_i += 1
+                if acc >= Ld:
+                    break
+            tx, ty, _ = pts[tgt_i]
+            # 车辆坐标系下目标点的横向偏移 y_r
+            dx_r =  (tx - rx) * math.cos(ryaw) + (ty - ry) * math.sin(ryaw)
+            dy_r = -(tx - rx) * math.sin(ryaw) + (ty - ry) * math.cos(ryaw)
+            L2 = max(dx_r * dx_r + dy_r * dy_r, 1e-3)
+            # 标准 Pure Pursuit: delta = atan2(2L*y_r, L²)
+            delta = math.atan2(2.0 * self.L * dy_r, L2)
+            delta = max(-self.delta_max, min(self.delta_max, delta))
+        else:
+            # 抑制后向分量
+            angle_to_next = math.atan2(pts[nxt][1] - ry, pts[nxt][0] - rx)
+            behind = abs(wrap(angle_to_next - ryaw)) > 1.8
+            if behind:
+                heading_err *= 0.3
+                cte         *= 0.3
+            v_eps  = max(0.5, rv)
+            delta  = (self.stanley_hg * heading_err -
+                      math.atan2(self.stanley_k * cte, v_eps))
+            delta  = max(-self.delta_max, min(self.delta_max, delta))
 
         kappa   = self._estimate_curvature(idx)
         # 使用 speed_limit 而不是 v_target，确保行为层限速生效
@@ -964,9 +1093,22 @@ class ControllerNode(Node):
         # 其中 L = wheel_base = 1.05m（前后轴中心距）
         omega = v_sched * math.tan(delta) / self.L
 
-        # ── 弯道预警降速（不等 PP 触发，提前降速）────────────────────────
-        if self._has_upcoming_turn():
-            v_sched *= 0.3   # 预警阶段主动降速 70%，提前约 3s 开始减速
+        # ── 弯道预警降速：渐进式 + 距离感知 ──────────────────────────────
+        # 问题背景：URDF 插件实际速度 = 指令 * (0.44/0.15) ≈ 2.93x（wheel_diameter
+        # 标签被插件忽略，使用默认 actuated_wheel_diameter=0.15m）。
+        # 指令 0.2 m/s → 实跑 0.59 m/s。过 1.95m 半径 Headland 90° 角需要
+        # 实际速度 < 0.2 m/s 才跟得住，对应指令 < 0.07 m/s。
+        # 策略：根据距最近急弯的距离线性减速——
+        #   d ≥ 5m: v_sched 不变（直道全速）
+        #   d ≤ 0.5m: v_sched × 0.15 (急弯中最低)
+        #   0.5-5m: 线性插值
+        turn_dist = self._upcoming_turn_distance()
+        if turn_dist < 5.0:
+            # 距弯道 5m 起开始减速，越近减得越多
+            # 最低 0.06 m/s (实跑≈0.18)：之前 0.03 在 Headland 弯角处速度太低
+            # 导致 Ackermann 转弯极慢，在 NW 角处卡死 30s+
+            factor = max(0.30, min(1.0, (turn_dist - 0.5) / 4.5 * 0.70 + 0.30))
+            v_sched = max(0.06, v_sched * factor)
 
         # ── 最终速度上限限制（确保不超过行为层限速）────────────────────
         v_sched = min(v_sched, self.speed_limit)
@@ -974,27 +1116,47 @@ class ControllerNode(Node):
         return v_sched, omega, delta
 
     def _estimate_curvature(self, idx: int) -> float:
+        """估计 idx 点处路径曲率（rad/m）。
+
+        算法：对圆弧上等距三点 A、B、C，计算外接圆半径。
+          - 用向量 BA、BC 夹角 θ 与弦长 |AC|
+          - R = |AC| / (2·sin(θ/2))
+          - κ = 1/R，保留 BA→BC 右手叉积符号标示左右转
+        旧版 bug：用"长弦方向 - 短弦方向"，但两弦都是弧的角平分线，方向几乎一致，
+                  使任何圆弧返回 κ≈0，导致 Headland 90° 圆角被当直路。
+        """
         pts = self.ref
         n   = len(pts)
-        # 防御性边界检查：确保 idx 在有效范围内
         if n < 5 or idx < 0 or idx >= n:
             return 0.0
-        i0  = max(0, idx - 3)
-        i2  = min(n - 1, idx + 3)
-        if i2 <= i0:
+        i_a = max(0, idx - 3)
+        i_c = min(n - 1, idx + 3)
+        i_b = idx
+        if i_a == i_b or i_b == i_c:
             return 0.0
-        dx = pts[i2][0] - pts[i0][0]
-        dy = pts[i2][1] - pts[i0][1]
-        if math.hypot(dx, dy) < 1e-3:
+        ax, ay = pts[i_a][0], pts[i_a][1]
+        bx, by = pts[i_b][0], pts[i_b][1]
+        cx, cy = pts[i_c][0], pts[i_c][1]
+        vax, vay = ax - bx, ay - by   # B→A
+        vcx, vcy = cx - bx, cy - by   # B→C
+        ac_len = math.hypot(cx - ax, cy - ay)
+        ba_len = math.hypot(vax, vay)
+        bc_len = math.hypot(vcx, vcy)
+        if ac_len < 1e-3 or ba_len < 1e-3 or bc_len < 1e-3:
             return 0.0
-        # 安全访问边界
-        i_next = min(n - 1, idx + 1)
-        i_prev = max(0, idx - 1)
-        da  = wrap(math.atan2(dy, dx) - math.atan2(
-            pts[i_next][1] - pts[i_prev][1],
-            pts[i_next][0] - pts[i_prev][0]))
-        arc = math.hypot(dx, dy)
-        return da / arc
+        # θ = 外角（0 = 直线，π = 180° 急转）= π - ∠ABC
+        cos_abc = (vax * vcx + vay * vcy) / (ba_len * bc_len)
+        cos_abc = max(-1.0, min(1.0, cos_abc))
+        angle_abc = math.acos(cos_abc)
+        theta = math.pi - angle_abc
+        if theta < 1e-4:
+            return 0.0
+        # R = (AC/2) / sin(θ/2)
+        R = (ac_len * 0.5) / math.sin(theta * 0.5)
+        kappa_mag = 1.0 / max(R, 1e-4)
+        # 符号由 BA × BC 叉积决定（z 分量）：>0 左转，<0 右转
+        cross = vax * vcy - vay * vcx
+        return kappa_mag if cross >= 0.0 else -kappa_mag
 
     # ── 壁面贴边 PD + 朝向修正（直接使用激光数据）──────────────────────
     def _edge_follow_pd(self):

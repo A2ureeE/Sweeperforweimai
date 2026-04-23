@@ -4,20 +4,27 @@ coverage_node:
     area_x_max:   14.5
     area_y_min:   -9.0
     area_y_max:    9.5
-    sweep_spacing:      1.0
+    # Skip-Row 策略：行间距 = 2 × sweep_hw = 1.95m（= 清扫带宽，完全无缝）
+    sweep_spacing:      1.95
     edge_offset:        0.8
     edge_follow_offset: 0.2
     grid_resolution:    0.5
     map_frame: odom
-    min_turn_radius: 1.1
+    # Skip-Row U-turn 半径 = 2 × sweep_hw = 1.95m（物理下限 0.88m，余量 2.2×）
+    min_turn_radius: 1.95
     body_long_offset:   1.41
     body_half_width:    0.525
     vehicle_min_turn_r: 0.88
     uturn_wall_safety:  0.25
+    # Headland（地头）参数：2 圈矩形沿边，用于释放 U-turn 空间
+    headland_rings:       2
+    headland_edge_offset: 0.78   # body_half_width + uturn_wall_safety
+    # Skip-Row 跳行模式开关（True=启用2圈Headland+Skip-Row, False=传统相邻道牛耕法）
+    use_skip_row:         true
 
 planner_node:
   ros__parameters:
-    lookahead_dist:        20.0
+    lookahead_dist:        40.0
     obstacle_inflate:      0.6
     obstacle_memory_s:     8.0
     gate_align_dist:       4.0
