@@ -156,8 +156,9 @@ class TestPlannerStateMachine(unittest.TestCase):
 
     # ── Detour latch lifecycle ──────────────────────────────────────────
 
-    def test_latch_cleared_on_leaving_detour(self):
-        """Latch should be cleared when transitioning to REJOIN_PENDING."""
+    def test_latch_survives_rejoin_pending(self):
+        """Latch should survive REJOIN_PENDING so vehicle follows the smooth
+        curve back to ConvergePath instead of snapping to raw coverage slice."""
         p = self._make()
         p._planner_state = PlannerState.STATIC_DETOUR
         p._latched_detour_path = [(0, 0), (1, 1)]
@@ -165,8 +166,8 @@ class TestPlannerStateMachine(unittest.TestCase):
         p.mode = 'COVERAGE'
         p._update_planner_state(0, 0, 0, 10.0)
         self.assertEqual(p._planner_state, PlannerState.REJOIN_PENDING)
-        self.assertIsNone(p._latched_detour_path)
-        self.assertIsNone(p._latched_detour_meta)
+        self.assertIsNotNone(p._latched_detour_path)
+        self.assertIsNotNone(p._latched_detour_meta)
 
     def test_latch_cleared_on_recovery(self):
         """Latch should be cleared when entering RECOVERY_ACTIVE."""
@@ -179,8 +180,9 @@ class TestPlannerStateMachine(unittest.TestCase):
         self.assertEqual(p._planner_state, PlannerState.RECOVERY_ACTIVE)
         self.assertIsNone(p._latched_detour_path)
 
-    def test_latch_cleared_on_return_to_normal(self):
-        """Latch should be cleared when transitioning from detour to NORMAL."""
+    def test_latch_cleared_on_normal_after_rejoin(self):
+        """Latch should be cleared only when reaching NORMAL (not REJOIN_PENDING).
+        Simulate: REJOIN_PENDING -> mode stays COVERAGE -> eventually NORMAL."""
         p = self._make()
         p._planner_state = PlannerState.DYNAMIC_AVOID
         p._latched_detour_path = [(2, 2), (3, 3)]
@@ -188,6 +190,9 @@ class TestPlannerStateMachine(unittest.TestCase):
         p.mode = 'COVERAGE'
         p._update_planner_state(0, 0, 0, 20.0)
         self.assertEqual(p._planner_state, PlannerState.REJOIN_PENDING)
+        self.assertIsNotNone(p._latched_detour_path)
+        # Now transition to NORMAL
+        p._transition_state(PlannerState.NORMAL, 'rejoin_complete')
         self.assertIsNone(p._latched_detour_path)
 
     def test_latch_survives_within_same_detour_episode(self):

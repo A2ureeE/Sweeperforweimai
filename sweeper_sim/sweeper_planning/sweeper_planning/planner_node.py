@@ -67,7 +67,7 @@ class PlannerNode(Node):
             ('wall_filter_margin',        0.5),
             ('map_config_file',          ''),
             ('lookahead_dist',            8.0),
-            ('obstacle_inflate',           0.6),
+            ('obstacle_inflate',           0.8),
             ('obstacle_detour_range',      0.7),
             ('obstacle_memory_s',          8.0),
             ('gate_align_dist',            4.0),
@@ -699,6 +699,8 @@ class PlannerNode(Node):
             return
 
         # ── 平滑避障（仅 bridge detour，单次锁存） ─────────────────
+        # 在 COVERAGE / STATIC_DETOUR / DYNAMIC_AVOID 三种模式下都主动检测
+        # 路径 slice 上的障碍并生成桥接绕行，不再仅依赖 behavior 前方走廊判定。
         if self.mode in ('COVERAGE', 'STATIC_DETOUR', 'DYNAMIC_AVOID'):
             if self.detour_latch_once and self._latched_detour_path is not None:
                 if len(self._latched_detour_path) >= 2:
@@ -707,8 +709,7 @@ class PlannerNode(Node):
                         '[DETOUR_LATCH_REUSE] publishing latched smooth path '
                         f'len={len(slice_pts)}',
                         throttle_duration_sec=2.0)
-            elif self.mode in ('STATIC_DETOUR', 'DYNAMIC_AVOID'):
-                pre_detour = slice_pts[:]
+            else:
                 bridge_detour = self._plan_bridge_detour(slice_pts, rx, ry, ryaw)
                 if bridge_detour is not None:
                     slice_pts, hit_obs, hit_clear, min_clear = bridge_detour
@@ -1230,16 +1231,15 @@ class PlannerNode(Node):
         return best
 
     def _plan_bridge_detour(self, pts: list, rx: float, ry: float, ryaw: float):
-        """围绕正前方阻塞物生成平滑桥接路径，替代简单点级排斥。"""
+        """围绕路径上的障碍物生成平滑桥接路径。
+        候选判定基于障碍到 path slice 的距离，不限制必须在车辆正前方。"""
         if len(pts) < 6 or not self.obs_memory:
             return None
 
-        candidate_thresh = max(self.inflate + 0.25, self.detour_range + 0.10)
+        candidate_thresh = max(self.inflate + 0.4, self.detour_range + 0.25,
+                               self.vehicle_width * 0.5 + 0.35)
         candidates = []
         for ox, oy in self.obs_memory.keys():
-            lx, ly = self._robot_frame(ox, oy, rx, ry, ryaw)
-            if lx < -0.4 or abs(ly) > 3.5:
-                continue
             best_i = 0
             best_d = float('inf')
             for i, (px, py) in enumerate(pts):
@@ -1254,9 +1254,27 @@ class PlannerNode(Node):
             return None
 
         candidates.sort(key=lambda item: (item[0], item[1]))
-        hit_i, hit_d, ox, oy = candidates[0]
-        start_i = max(1, hit_i - 4)
-        end_i = min(len(pts) - 2, hit_i + 8)
+
+        # 合并多个障碍的影响区间 [start_i, end_i]
+        intervals = []
+        for hit_i, hit_d, cox, coy in candidates:
+            si = max(1, hit_i - 4)
+            ei = min(len(pts) - 2, hit_i + 8)
+            intervals.append((si, ei, cox, coy))
+
+        merged = []
+        for si, ei, cox, coy in intervals:
+            if merged and si <= merged[-1][1] + 5:
+                prev = merged[-1]
+                merged[-1] = (prev[0], max(prev[1], ei),
+                              prev[2] + [(cox, coy)])
+            else:
+                merged.append((si, ei, [(cox, coy)]))
+
+        # 取覆盖障碍数最多（或最长）的合并区间
+        merged.sort(key=lambda m: (len(m[2]), m[1] - m[0]), reverse=True)
+        start_i, end_i, obs_list = merged[0]
+
         if end_i - start_i < 3:
             return None
 
@@ -1272,14 +1290,21 @@ class PlannerNode(Node):
         nx = -ty
         ny = tx
 
-        px, py = pts[hit_i]
-        lateral_err = (ox - px) * nx + (oy - py) * ny
+        # 用所有合并区间内的障碍计算最大偏移需求
         min_safe_clear = max(
             self.inflate + 0.10,
             self.vehicle_width * 0.5 + self.bridge_detour_margin,
         )
         desired_clear = max(min_safe_clear + 0.20, self.detour_shift * 1.05)
-        detour_amp = max(desired_clear, abs(lateral_err) + min_safe_clear + 0.18)
+        max_lateral = 0.0
+        for cox, coy in obs_list:
+            ci = min(range(start_i, end_i + 1),
+                     key=lambda i: math.hypot(pts[i][0] - cox, pts[i][1] - coy))
+            lat = abs((cox - pts[ci][0]) * nx + (coy - pts[ci][1]) * ny)
+            if lat > max_lateral:
+                max_lateral = lat
+
+        detour_amp = max(desired_clear, max_lateral + min_safe_clear + 0.18)
         detour_amp = min(
             detour_amp,
             max(min_safe_clear + 0.12, self.bridge_detour_max_shift),
@@ -1288,9 +1313,10 @@ class PlannerNode(Node):
 
         current_clear = self._segment_min_clearance(pts, start_i, end_i)
         choices = {}
+        primary_ox, primary_oy = obs_list[0]
 
-        same_obs = (math.hypot(ox - self._last_bridge_obs[0],
-                               oy - self._last_bridge_obs[1]) < 1.0)
+        same_obs = (math.hypot(primary_ox - self._last_bridge_obs[0],
+                               primary_oy - self._last_bridge_obs[1]) < 1.0)
 
         for sign in (1.0, -1.0):
             out = pts[:]
@@ -1302,11 +1328,16 @@ class PlannerNode(Node):
                 out[i] = (pts[i][0] + nx * offset, pts[i][1] + ny * offset)
 
             min_clear = self._segment_min_clearance(out, start_i, end_i)
-            hit_clear = min(
-                math.hypot(out[i][0] - ox, out[i][1] - oy)
-                for i in range(start_i, end_i + 1)
-            )
-            away_bonus = -sign * math.copysign(1.0, lateral_err) if abs(lateral_err) > 1e-3 else 0.0
+            hit_clear = 999.0
+            for cox, coy in obs_list:
+                for i in range(start_i, end_i + 1):
+                    d = math.hypot(out[i][0] - cox, out[i][1] - coy)
+                    if d < hit_clear:
+                        hit_clear = d
+            lateral_err = (primary_ox - pts[start_i][0]) * nx + \
+                          (primary_oy - pts[start_i][1]) * ny
+            away_bonus = -sign * math.copysign(1.0, lateral_err) \
+                if abs(lateral_err) > 1e-3 else 0.0
             score = min_clear + 0.35 * hit_clear + 0.15 * away_bonus
             choices[sign] = (score, out, hit_clear, min_clear)
 
@@ -1319,24 +1350,19 @@ class PlannerNode(Node):
                 best_sign = self._last_bridge_sign
 
         self._last_bridge_sign = best_sign
-        self._last_bridge_obs = (ox, oy)
+        self._last_bridge_obs = (primary_ox, primary_oy)
         best_score, out_best, hit_clear, min_clear = choices[best_sign]
-        best_choice = (out_best, hit_clear, min_clear)
 
-        if best_choice is None:
-            return None
-
-        out, hit_clear, min_clear = best_choice
         if min_clear < min_safe_clear or hit_clear < min_safe_clear:
             self.get_logger().warn(
-                f'[BRIDGE_DETOUR_REJECT] obstacle=({ox:.1f},{oy:.1f}) '
+                f'[BRIDGE_DETOUR_REJECT] obstacles={len(obs_list)} '
                 f'min_clear={min_clear:.2f}m hit_clear={hit_clear:.2f}m '
                 f'< safe={min_safe_clear:.2f}m',
                 throttle_duration_sec=0.5)
             return None
         if min_clear < current_clear + 0.05 and hit_clear < desired_clear:
             return None
-        return out, (ox, oy), hit_clear, min_clear
+        return out_best, (primary_ox, primary_oy), hit_clear, min_clear
 
     def _apply_detour(self, pts: list) -> list:
         if not self.obs_memory:
@@ -1498,8 +1524,6 @@ class PlannerNode(Node):
             self._detour_start_idx = None
             self._detour_clear_pending = False
             self._clear_detour_latch('normal')
-        elif new_state == PlannerState.REJOIN_PENDING:
-            self._clear_detour_latch('rejoin_pending')
         self._planner_state = new_state
         self._cov_version_at_state_entry = self._cov_version
 

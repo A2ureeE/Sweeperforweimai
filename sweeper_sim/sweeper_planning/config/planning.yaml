@@ -30,7 +30,7 @@ planner_node:
     area_y_max:              9.5
     wall_filter_margin:      0.5
     lookahead_dist:        40.0
-    obstacle_inflate:      0.6
+    obstacle_inflate:      0.8
     obstacle_detour_range: 0.7
     obstacle_memory_s:     8.0
     gate_align_dist:       4.0
