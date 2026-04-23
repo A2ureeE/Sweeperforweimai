@@ -55,7 +55,7 @@ class PlannerNode(Node):
             ('stagnation_time_s',          6.0),
             ('stagnation_min_dist_total',  0.5),
             # 避障回切迟滞：考虑车身长度，避免车尾尚未通过障碍就回切原路径
-            ('rejoin_tail_clearance_m',    2.1),
+            ('rejoin_tail_clearance_m',    1.5),
             ('rejoin_min_hold_s',          0.8),
             # 穿门路径参数
             ('gate_approach_dist',         1.2),  # 门前等待点距门中心的距离

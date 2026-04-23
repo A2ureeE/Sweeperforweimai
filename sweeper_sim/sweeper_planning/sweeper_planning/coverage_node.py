@@ -40,7 +40,8 @@ def wrap(a):
 
 
 def _arc_pts(cx, cy, r, a_start, a_end, n=24):
-    angles = np.linspace(a_start, a_end, n)
+    # Exclude the arc start point; caller already appended the line endpoint.
+    angles = np.linspace(a_start, a_end, n + 1)[1:]
     return list(zip(cx + r * np.cos(angles), cy + r * np.sin(angles)))
 
 
@@ -383,6 +384,18 @@ class CoverageNode(Node):
         n_lanes = max(1, int(2 * iy_half / lane_spacing) + 1)
         # 实际对称分布的最大半高（让末行恰好居中对齐）
         effective_half = (n_lanes - 1) * lane_spacing / 2.0
+        lanes_y = []
+        visit_order = []
+        first_lane_y = None
+        if n_lanes >= 2:
+            # lane y 坐标（对称分布，索引 0 = 最下）
+            lanes_y = [(i - (n_lanes - 1) / 2.0) * lane_spacing for i in range(n_lanes)]
+            # 奇偶分两轮访问顺序
+            odd_seq = list(range(0, n_lanes, 2))    # [0,2,4,...] 由下向上跳跃
+            even_seq = list(range(n_lanes - 1 - (0 if (n_lanes - 1) % 2 == 1 else 1),
+                                  0, -2))           # [N-2 or N-1, ..., 3, 1] 由上向下
+            visit_order = odd_seq + even_seq
+            first_lane_y = lanes_y[visit_order[0]]
 
         # x 方向内层扫行端点
         ix_min = self.xmin + x_margin
@@ -429,7 +442,13 @@ class CoverageNode(Node):
         prev_ring_end = None   # (x, y, yaw)
         for k in range(self.headland_rings):
             ring_off = self.headland_off + k * headland_thickness
-            ring_pts = self._boundary_strip(ring_off, corner_r=corner_r)
+            ring_early_exit_y = None
+            if k == self.headland_rings - 1 and first_lane_y is not None:
+                ring_early_exit_y = first_lane_y + 0.5
+            ring_pts = self._boundary_strip(
+                ring_off,
+                corner_r=corner_r,
+                early_exit_y=ring_early_exit_y)
             if not ring_pts:
                 self.get_logger().warn(
                     f'⚠ Headland 圈 {k+1} 生成失败（偏移 {ring_off:.2f}m 太大）')
@@ -437,12 +456,19 @@ class CoverageNode(Node):
 
             ring_start = ring_pts[0]          # 朝东出发
             ring_start_yaw = 0.0
-            ring_end = ring_pts[-1]           # SW 弧终点，SW 点处切线朝北？再细看
-            # _boundary_strip 闭合后最后一段是 SW 1/4 弧（angles π → 3π/2）
-            # 在 3π/2 处切线方向：对于 CCW 弧，切线 = rotate(radius, +90°)
-            # radius 方向 = (cos(3π/2), sin(3π/2)) = (0,-1) 即南方
-            # 切线 = rotate(南, +90°) = 东 (0°)
-            ring_end_yaw = 0.0
+            ring_end = ring_pts[-1]
+            if ring_early_exit_y is not None:
+                # 内环在左侧边提前截断，末端切线朝南
+                ring_end_yaw = -math.pi / 2.0
+                self.get_logger().info(
+                    f'[Ring open-loop] ring{k+1} 西侧截断 y={ring_end[1]:.2f}, '
+                    f'目标 lane0_y={first_lane_y:.2f}')
+            else:
+                # _boundary_strip 闭合后最后一段是 SW 1/4 弧（angles π → 3π/2）
+                # 在 3π/2 处切线方向：对于 CCW 弧，切线 = rotate(radius, +90°)
+                # radius 方向 = (cos(3π/2), sin(3π/2)) = (0,-1) 即南方
+                # 切线 = rotate(南, +90°) = 东 (0°)
+                ring_end_yaw = 0.0
 
             if prev_ring_end is not None:
                 # 用 Hermite 弧连接上一圈 SW 终点 → 本圈 SW 起点
@@ -464,35 +490,39 @@ class CoverageNode(Node):
         # ── 第 2 步：内层 Skip-Row ────────────────────────────────────
         # lane y 坐标（对称分布，索引 0 = 最下）
         if n_lanes >= 2:
-            lanes_y = [(i - (n_lanes - 1) / 2.0) * lane_spacing for i in range(n_lanes)]
-
-            # 奇偶分两轮访问顺序
-            odd_seq = list(range(0, n_lanes, 2))    # [0,2,4,...] 由下向上跳跃
-            even_seq = list(range(n_lanes - 1 - (0 if (n_lanes - 1) % 2 == 1 else 1),
-                                  0, -2))           # [N-2 or N-1, ..., 3, 1] 由上向下
             # 确保奇偶序列不空且互补
             # 对 n_lanes=7: odd=[0,2,4,6], even=[5,3,1] → 合集 [0..6] ✓
             # 对 n_lanes=8: odd=[0,2,4,6], even=[7,5,3,1] ✓
             # 对 n_lanes=6: odd=[0,2,4], even=[5,3,1] ✓
-            visit_order = odd_seq + even_seq
             # 校验完整覆盖
             if sorted(visit_order) != list(range(n_lanes)):
                 self.get_logger().error(
                     f'❌ Skip-Row 访问序列不完整: {visit_order} vs {list(range(n_lanes))}')
 
             # ── Ring 末 → lane 0 起点：Hermite 过渡弧（R1）──
-            first_lane_y = lanes_y[visit_order[0]]
             first_lane_start = (ix_min, first_lane_y)
             if prev_ring_end is not None:
                 pe_x, pe_y, pe_yaw = prev_ring_end
-                bridge = _cubic_bridge(
-                    (pe_x, pe_y), pe_yaw,
-                    first_lane_start, 0.0,     # 朝东进入 lane 0
-                    n=20)
+                # 按用户要求改为直角并入：先沿西侧竖直下行，再水平并入 lane0
+                bridge = []
+                elbow = (pe_x, first_lane_start[1])
+                # 段1：竖直（保持在西侧 x=pe_x）
+                if abs(pe_y - elbow[1]) > 1e-3:
+                    n_v = max(2, int(abs(pe_y - elbow[1]) / 0.5) + 1)
+                    ys = np.linspace(pe_y, elbow[1], n_v)
+                    for yv in ys[1:]:
+                        bridge.append((float(pe_x), float(yv)))
+                # 段2：水平（并入 lane0 起点，朝东）
+                if abs(elbow[0] - first_lane_start[0]) > 1e-3:
+                    n_h = max(2, int(abs(first_lane_start[0] - elbow[0]) / 0.5) + 1)
+                    xs = np.linspace(elbow[0], first_lane_start[0], n_h)
+                    for xv in xs[1:]:
+                        bridge.append((float(xv), float(first_lane_start[1])))
                 if bridge:
                     pts.extend(bridge)
                     self.get_logger().info(
-                        f'[Ring→Lane bridge] ({pe_x:.2f},{pe_y:.2f})→'
+                        f'[Ring→Lane right-angle] ({pe_x:.2f},{pe_y:.2f})→'
+                        f'elbow=({elbow[0]:.2f},{elbow[1]:.2f})→'
                         f'({first_lane_start[0]:.2f},{first_lane_start[1]:.2f}) '
                         f'{len(bridge)}点')
 
@@ -771,7 +801,7 @@ class CoverageNode(Node):
         self._check_path_continuity(pts, label='Boustrophedon')
         return pts
 
-    def _boundary_strip(self, off, corner_r: float = 0.0):
+    def _boundary_strip(self, off, corner_r: float = 0.0, early_exit_y=None):
         """生成矩形边界贴边路径（逆时针: SW → SE → NE → NW → SW）。
 
         Args:
@@ -812,8 +842,14 @@ class CoverageNode(Node):
             pts.extend(_arc_pts(xmin + cr, ymax - cr, cr,
                                 math.pi / 2, math.pi, 12))
             # 左边：NW → SW
+            early_exit_done = False
             for y in np.arange(ymax - cr, ymin + cr, -step):
                 pts.append((float(xmin), float(y)))
+                if early_exit_y is not None and y <= early_exit_y:
+                    early_exit_done = True
+                    break
+            if early_exit_done:
+                return pts
             pts.append((float(xmin), float(ymin + cr)))
             # SW 1/4 弧
             pts.extend(_arc_pts(xmin + cr, ymin + cr, cr,
@@ -826,7 +862,14 @@ class CoverageNode(Node):
             pts.append((float(xmax), float(ymax)))
             for x in np.arange(xmax, xmin, -step): pts.append((float(x), float(ymax)))
             pts.append((float(xmin), float(ymax)))
-            for y in np.arange(ymax, ymin, -step): pts.append((float(xmin), float(y)))
+            early_exit_done = False
+            for y in np.arange(ymax, ymin, -step):
+                pts.append((float(xmin), float(y)))
+                if early_exit_y is not None and y <= early_exit_y:
+                    early_exit_done = True
+                    break
+            if early_exit_done:
+                return pts
             pts.append((float(xmin), float(ymin)))
         return pts
 
